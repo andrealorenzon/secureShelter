@@ -1,0 +1,20 @@
+{
+	"textureWidth": 16,
+	"textureHeight": 32,
+	"elements": [
+		{
+			"name": "doorleaf",
+			"comment": "Full-width door leaf, 2px thick, centred in the cell. Uses a real door texture.",
+			"from": [0.5, 0, 7],
+			"to": [15.5, 16, 9],
+			"faces": {
+				"north": { "texture": "#door", "uv": [0, 0, 16, 32] },
+				"south": { "texture": "#door", "uv": [16, 0, 0, 32] },
+				"east":  { "texture": "#door", "uv": [7, 0, 9, 32] },
+				"west":  { "texture": "#door", "uv": [7, 0, 9, 32] },
+				"up":    { "texture": "#door", "uv": [0, 7, 16, 9] },
+				"down":  { "texture": "#door", "uv": [0, 7, 16, 9] }
+			}
+		}
+	]
+}

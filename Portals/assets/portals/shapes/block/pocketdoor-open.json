@@ -1,0 +1,20 @@
+{
+	"textureWidth": 16,
+	"textureHeight": 32,
+	"elements": [
+		{
+			"name": "doorleaf",
+			"comment": "Same leaf swung ~90 degrees onto its left (x=0) hinge, clearing the doorway.",
+			"from": [0, 0, 0.5],
+			"to": [2, 16, 15.5],
+			"faces": {
+				"north": { "texture": "#door", "uv": [7, 0, 9, 32] },
+				"south": { "texture": "#door", "uv": [7, 0, 9, 32] },
+				"east":  { "texture": "#door", "uv": [0, 0, 16, 32] },
+				"west":  { "texture": "#door", "uv": [16, 0, 0, 32] },
+				"up":    { "texture": "#door", "uv": [0, 0, 2, 16] },
+				"down":  { "texture": "#door", "uv": [0, 0, 2, 16] }
+			}
+		}
+	]
+}
