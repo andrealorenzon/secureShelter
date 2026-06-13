@@ -1,10 +1,13 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
 using Manifold.Api;
 using Manifold.Api.Server;
 using Manifold.Api.Transitions;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
+using Vintagestory.API.Datastructures;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
 
@@ -12,23 +15,45 @@ namespace Portals;
 
 public class PortalsModSystem : ModSystem
 {
-    // ── Identity / geometry constants (shared with worldgen + the door block) ────
+    // ── Identity ─────────────────────────────────────────────────────────────
     public const string Domain = "portals";
 
-    public static readonly AssetLocation PocketDimCode = new(Domain, "pocket");
+    // Bumped whenever the dimension's baked-in layout changes — Manifold caches generated columns
+    // and won't regenerate in place, so a new code forces a fresh dimension.
+    // pocket5: bosco interior. pocket6: build lowered to floor y=1 so it sits inside the relight band.
+    public static readonly AssetLocation PocketDimCode = new(Domain, "pocket6");
     public static readonly AssetLocation OverworldCode = new("manifold", "overworld");
 
-    // Pocket platform layout (dimension-local coordinates). A flat slab centered on
-    // (PlatformCenterX, PlatformCenterZ) with its top surface walkable at FloorY+1.
-    public const int FloorY = 64;
-    public const int PlatformCenterX = 8;
-    public const int PlatformCenterZ = 8;
-    public const int PlatformHalf = 7;            // → 15×15 slab (half*2+1)
+    // ── Pocket geometry (dimension-local coordinates) ────────────────────────
+    // A hollow 40×40×40 shell of mantle: x/z span ShellMin..ShellMax, y spans FloorY..ShellTopY.
+    public const int FloorY = 1;                // kept low so the whole build fits the relight band
+    public const int ShellMin = 0;
+    public const int ShellMax = 39;             // 40 blocks (0..39)
+    public const int ShellTopY = FloorY + 39;   // 40 → 40 tall
 
-    // Fixed spawn: standing on top of the slab. The 4th arg (dimension) is 0 here —
-    // Manifold rebases the spawn into the pocket dimension on registration.
-    public static readonly BlockPos PocketSpawn =
-        new(PlatformCenterX, FloorY + 1, PlatformCenterZ, 0);
+    // Mantle has no light absorption, so light leaks straight through the shell. We wrap it in a
+    // 42×42×42 opaque dirt box (one block out on every side) to seal the interior.
+    public const int DirtMin = ShellMin - 1;    // -1
+    public const int DirtMax = ShellMax + 1;    // 40  → 42 blocks (-1..40)
+    public const int DirtBottomY = FloorY - 1;  // 0
+    public const int DirtTopY = ShellTopY + 1;  // 41 → 42 tall
+
+    // Fixed spawn inside the bosco interior, raised 8 m above the floor so the player lands on the
+    // forest surface rather than inside the terrain. (4th arg dimension 0; Manifold rebases it.)
+    public const int SpawnX = 19;
+    public const int SpawnZ = 31;
+    public static readonly BlockPos PocketSpawn = new(SpawnX, FloorY + 8, SpawnZ, 0);   // y = 9
+
+    // Return arch: a free-standing 3×3 stone wall with a 1-wide × 2-tall walk-through hole, a few
+    // blocks behind the spawn (so the player faces into the forest), at the spawn's standing height.
+    public const int ArchCenterX = SpawnX;          // 19
+    public const int ArchZ = SpawnZ + 4;            // 35 — behind the spawn
+    public const int ArchBaseY = FloorY + 8;        // 9 — floor of the hole, level with the spawn
+    // Hole cells: (ArchCenterX, ArchBaseY, ArchZ) and (ArchCenterX, ArchBaseY+1, ArchZ).
+
+    // The pre-built interior (a 40×40×30 forest), placed once into the shell on first entry.
+    private static readonly AssetLocation BoscoAsset = new(Domain, "schematics/bosco.json");
+    private BlockSchematic? boscoSchematic;
 
     /// <summary>Server-side Manifold facade, resolved in <see cref="StartServerSide"/>.</summary>
     public IManifoldServer? Manifold { get; private set; }
@@ -38,10 +63,12 @@ public class PortalsModSystem : ModSystem
 
     private ICoreServerAPI? sapi;
 
-    // Walk-through debounce. The detection scan can report a player inside a doorway on
-    // many consecutive ticks, so we collapse one continuous pass into a single transit.
-    // Consecutive detections (gap < ContinuousPassGapMs) are the same pass; a longer gap
-    // means the player left the doorway, re-arming the next crossing.
+    // A throwaway solid block used to force the engine's real relight (see ForceRelight): placing
+    // then removing it is what a player does manually with a light to "fix" the lighting.
+    private int tempBlockId;
+
+    // Walk-through debounce: the per-tick scan can report a player inside the arch hole on many
+    // consecutive ticks, so we collapse one continuous pass into a single transit.
     private const long ContinuousPassGapMs = 300;
     private readonly Dictionary<string, long> lastInsideMs = new();
     private readonly HashSet<string> triggeredThisPass = new();
@@ -55,7 +82,7 @@ public class PortalsModSystem : ModSystem
     public override void Start(ICoreAPI api)
     {
         base.Start(api);
-        api.RegisterBlockClass("portals.pocketdoor", typeof(BlockPocketDoor));
+        api.RegisterBlockClass("portals.painting", typeof(BlockPaintingPortal));
     }
 
     public override void StartServerSide(ICoreServerAPI sapi)
@@ -72,12 +99,12 @@ public class PortalsModSystem : ModSystem
             return;
         }
 
+        tempBlockId = sapi.World.GetBlock(new AssetLocation("game", "rock-granite"))?.BlockId ?? 0;
+
         RegisterPocketDimension(sapi);
         RegisterDebugCommand(sapi);
 
-        // Detect door crossings ourselves every tick (see OnServerTick) rather than via
-        // Block.OnEntityInside, which samples only the feet block and intermittently
-        // misses fast or boundary-straddling walk-throughs.
+        // Detect arch walk-throughs ourselves every tick (see OnServerTick).
         sapi.Event.RegisterGameTickListener(OnServerTick, 20);
 
         sapi.Event.PlayerDisconnect += p =>
@@ -89,32 +116,117 @@ public class PortalsModSystem : ModSystem
         };
 
         sapi.Event.PlayerNowPlaying += OnPlayerNowPlaying;
+
+        // Manifold doesn't relight block light in a dimension via the FullRelight / bulk-accessor
+        // APIs (confirmed: they leave light at 0). The ONLY path that works is the engine's normal
+        // block place/break relight. So when a player edits a block in the pocket, we replicate the
+        // "place a block then pick it up" fix near them (see ForceRelight).
+        sapi.Event.DidPlaceBlock += (player, oldId, blockSel, stack) => RelightAroundPlayer(player);
+        sapi.Event.DidBreakBlock += (player, oldId, blockSel) => RelightAroundPlayer(player);
     }
 
-    // The engine does not reliably restore a player's dimension on relog, so we never ask
-    // it where the player is — we track that ourselves in the persistent "portals:inPocket"
-    // watched attribute (set on entry, cleared on return). A login is also not a transit, so
-    // Manifold never loads the pocket's chunks on its own: a player who logged out in the
-    // pocket would otherwise spawn into empty void.
-    //
-    // Recipe (mirrors the shipped Personal Pocket Dimension mod — see docs/manifold.md §11):
-    //   1. Load the platform's chunk footprint ourselves via WorldManager (no transit needed).
-    //   2. Transit the player onto the spawn with an explicit OverridePosition. With the chunks
-    //      already loaded this is reliable; if the engine actually kept them in the pocket the
-    //      transit is a harmless no-op (they were already standing on the now-loaded platform).
-    //   3. Re-stamp the return door after the chunk settles (+500ms, +2000ms) so it can't come
-    //      back client-desynced and inert — the bug that previously stranded players on relog.
-    // They stay in the pocket; the return door and /back still work to leave.
+    private static int DimFromInternalY(double internalY) => (int)(internalY / BlockPos.DimensionBoundary);
+
+    // ── Lighting (forced relight; see comments above) ────────────────────────
+
+    // Replicate a player's place+pickup near someone who just edited a block, but only in the pocket.
+    private void RelightAroundPlayer(IServerPlayer? player)
+    {
+        if (sapi == null || PocketDimId < 0 || player?.Entity == null) return;
+        if (DimFromInternalY(player.Entity.Pos.InternalY) != PocketDimId) return;
+        ForceRelight(PlayerLocalPos(player));
+    }
+
+    // Force the engine's real relight by doing exactly what fixes it by hand: place a solid block in
+    // an empty cell, then remove it a tick later. Two genuine block changes through the DEFAULT
+    // accessor trigger the lighting flood that FullRelight / bulk relight don't. Only blinks empty
+    // cells (non-destructive) and keeps block-entity blocks like lanterns untouched.
+    private void ForceRelight(BlockPos airCell)
+    {
+        if (sapi == null || tempBlockId == 0) return;
+        IBlockAccessor ba = sapi.World.BlockAccessor;
+        if (ba.GetBlock(airCell).BlockId != 0) return;
+
+        ba.SetBlock(tempBlockId, airCell);                              // place (relight #1)
+        sapi.World.RegisterCallback(_ =>
+        {
+            if (sapi.World.BlockAccessor.GetBlock(airCell).BlockId == tempBlockId)
+                sapi.World.BlockAccessor.SetBlock(0, airCell);          // remove (relight #2)
+        }, 150);
+    }
+
+    // Relight the whole interior by doing the manual fix to EVERY light source at once: scan the
+    // room, pull out every light-emitting block, then re-place them a tick later. Block-entity
+    // blocks (lanterns store their metal/glass there) have their data captured and restored so they
+    // come back identical. This is what reliably lights the room on entry / login.
+    private void RelightAllSources()
+    {
+        if (sapi == null || PocketDimId < 0) return;
+        IBlockAccessor ba = sapi.World.BlockAccessor;
+
+        var sources = new List<(BlockPos pos, int id, ITreeAttribute? be)>();
+        for (int x = ShellMin + 1; x < ShellMax; x++)
+        for (int z = ShellMin + 1; z < ShellMax; z++)
+        for (int y = FloorY + 1; y < ShellTopY; y++)
+        {
+            var pos = new BlockPos(x, y, z, PocketDimId);
+            Block b = ba.GetBlock(pos);
+            if (b.BlockId == 0 || b.LightHsv[2] <= 0) continue;
+
+            ITreeAttribute? tree = null;
+            if (b.EntityClass != null && ba.GetBlockEntity(pos) is { } be)
+            {
+                tree = new TreeAttribute();
+                be.ToTreeAttributes(tree);
+            }
+            sources.Add((pos.Copy(), b.BlockId, tree));
+        }
+
+        if (sources.Count == 0) return;
+
+        foreach (var s in sources) ba.SetBlock(0, s.pos);                    // remove all (relight)
+
+        sapi.World.RegisterCallback(_ =>
+        {
+            foreach (var s in sources)
+            {
+                ba.SetBlock(s.id, s.pos);                                    // re-place (relight)
+                if (s.be != null && ba.GetBlockEntity(s.pos) is { } nbe)
+                {
+                    nbe.FromTreeAttributes(s.be, sapi.World);
+                    nbe.MarkDirty(true);
+                }
+            }
+        }, 150);
+    }
+
+    private BlockPos PlayerLocalPos(IServerPlayer player)
+    {
+        EntityPos ep = player.Entity.Pos;
+        int dim = DimFromInternalY(ep.InternalY);
+        int ly = (int)Math.Floor(ep.InternalY) - dim * BlockPos.DimensionBoundary;
+        return new BlockPos((int)Math.Floor(ep.X), ly + 1, (int)Math.Floor(ep.Z), dim);
+    }
+
+    private string LightReport(BlockPos p)
+    {
+        IBlockAccessor ba = sapi!.World.BlockAccessor;
+        int block = ba.GetLightLevel(p, EnumLightLevelType.OnlyBlockLight);
+        int sun = ba.GetLightLevel(p, EnumLightLevelType.OnlySunLight);
+        int max = ba.GetLightLevel(p, EnumLightLevelType.MaxLight);
+        return $"block={block} sun={sun} max={max}";
+    }
+
+    // ── Relog handling ───────────────────────────────────────────────────────
+    // We track whether a player is in the pocket with the persistent "portals:inPocket" watched
+    // attribute. A login is not a transit, so Manifold won't load the pocket's chunks on its own
+    // and the player would spawn into void. On login we therefore load the footprint, transit them
+    // back onto the spawn, and run the repair pass.
     private void OnPlayerNowPlaying(IServerPlayer player)
     {
         if (Manifold == null || player.Entity == null) return;
         if (!player.Entity.WatchedAttributes.GetBool("portals:inPocket")) return;
 
-        // Longer delay so the login handshake fully completes before we transit. Transiting too
-        // early races chunk delivery and was the cause of the client-side "inert door" desync;
-        // 1500 ms reliably clears it. (Diagnostics confirmed the engine restores the player into
-        // the pocket dimension correctly on login, so this transit lands them back on the spawn
-        // with the chunk freshly sent, and the repair pass re-syncs the door.)
         sapi!.World.RegisterCallback(_ =>
         {
             if (player.Entity == null) return;
@@ -124,125 +236,166 @@ public class PortalsModSystem : ModSystem
             Manifold.Transitions.TeleportPlayer(
                 player, PocketDimCode, new TransitionOptions { OverridePosition = PocketSpawnPos() });
             SchedulePocketRepair();
-            Mod.Logger.Notification(
-                "[Portals] Restored uid={0} into pocket on login.", player.PlayerUID);
+            Mod.Logger.Notification("[Portals] Restored uid={0} into pocket on login.", player.PlayerUID);
         }, 1500);
     }
 
-    // ── Chunk loading + fixture repair (the relog/desync hardening) ───────────
-    // Manifold force-sends a dimension's chunks only during a transit, so we load the pocket's
-    // footprint ourselves whenever we need it present without one (e.g. on login). Generating a
-    // missing column also re-runs PocketPlatformWorldgen, rebuilding the slab + return door.
-
-    private BlockPos PocketSpawnPos() => new(PlatformCenterX, FloorY + 1, PlatformCenterZ, PocketDimId);
-    private BlockPos ReturnDoorPos() => new(PlatformCenterX, FloorY + 1, PlatformCenterZ - PlatformHalf, PocketDimId);
+    // ── Chunk loading + interior setup ───────────────────────────────────────
+    private BlockPos PocketSpawnPos() => new(SpawnX, FloorY + 8, SpawnZ, PocketDimId);
 
     private void EnsurePocketChunksLoaded()
     {
         if (sapi == null || PocketDimId < 0) return;
 
-        int centerChunkX = PlatformCenterX / 32;
-        int centerChunkZ = PlatformCenterZ / 32;
-
-        // LOAD ONLY — never Create. The platform columns were generated by Manifold on first
-        // entry and are saved (persistent dimension); LoadChunkColumnForDimension brings those
-        // saved columns back into memory with the slab intact. CreateChunkColumnForDimension, by
-        // contrast, makes a fresh BLANK, unlit column (Manifold's worldgen only runs during a
-        // transit, not for manual creates) and overwrites the saved platform — which is what
-        // wiped the slab and killed block-light. So we only ever load here.
-        for (int cx = centerChunkX - 1; cx <= centerChunkX + 1; cx++)
-        for (int cz = centerChunkZ - 1; cz <= centerChunkZ + 1; cz++)
-        {
+        // LOAD ONLY — never Create. The columns were generated on first entry and are saved
+        // (persistent dimension); loading restores them intact.
+        int minChunk = ShellMin / 32 - 1;   // -1 margin
+        int maxChunk = ShellMax / 32 + 1;   // 40/32 = 1 → up to chunk 2
+        for (int cx = minChunk; cx <= maxChunk; cx++)
+        for (int cz = minChunk; cz <= maxChunk; cz++)
             sapi.WorldManager.LoadChunkColumnForDimension(cx, cz, PocketDimId);
-        }
     }
 
-    // Schedule two repair passes after a transit into the pocket: one once the chunk has had a
-    // moment to settle, one well after, matching the shipped PPD mod's +500/+2000ms cadence.
+    // After a transit into the pocket: place the bosco interior (once), stamp the return arch over
+    // it, and force a real relight.
     private void SchedulePocketRepair()
     {
         if (sapi == null) return;
-        sapi.World.RegisterCallback(_ => RepairPocketFixtures(), 500);
-        sapi.World.RegisterCallback(_ => RepairPocketFixtures(), 2000);
+        sapi.World.RegisterCallback(_ => { EnsureBoscoPlaced(); StampArch(); }, 2000);
+        sapi.World.RegisterCallback(_ => { EnsureBoscoPlaced(); StampArch(); RelightAllSources(); }, 3500);
     }
 
-    // Rebuild the platform (self-healing) and force the return door to resync.
-    //   • StampPlatform re-lays the slab + frame + door with a RELIGHTING bulk accessor, which
-    //     both restores any column a prior blank-create corrupted AND recomputes block light so
-    //     placed light sources work again.
-    //   • A bare MarkBlockDirty on the door forces a client resend even when the block is
-    //     unchanged — the cure for the "inert door" (no sound / no toggle / no walk-through) desync.
-    private void RepairPocketFixtures()
+    // (Re)build the return arch idempotently via a relighting bulk accessor. Stamped after the bosco
+    // so it sits on top of the forest; self-heals if a player breaks it, and keeps the hole open.
+    private void StampArch()
     {
         if (sapi == null || PocketDimId < 0) return;
 
-        StampPlatform();
-
-        BlockPos pos = ReturnDoorPos();
-        sapi.World.BlockAccessor.MarkBlockModified(pos);
-        sapi.World.BlockAccessor.MarkBlockDirty(pos);
-    }
-
-    // Re-lay the whole platform via direct block edits, idempotently. This mirrors what
-    // PocketPlatformWorldgen builds, but runs at runtime against an already-loaded chunk so it
-    // can heal a slab that was wiped (e.g. by an earlier blank-create) without a world regen.
-    // The bulk accessor commits with relight + synchronize, so the surface is re-lit and resent.
-    private void StampPlatform()
-    {
-        if (sapi == null || PocketDimId < 0) return;
-
-        Block? floor = sapi.World.GetBlock(new AssetLocation("game", "rock-granite"));
-        Block? door = sapi.World.GetBlock(new AssetLocation(Domain, "pocketdoor-south-closed"));
-        Block? torch = sapi.World.GetBlock(new AssetLocation("game", "torch-basic-lit-up"));
-        if (floor == null) return;
-        int floorId = floor.BlockId;
-
-        int minX = PlatformCenterX - PlatformHalf, maxX = PlatformCenterX + PlatformHalf;
-        int minZ = PlatformCenterZ - PlatformHalf, maxZ = PlatformCenterZ + PlatformHalf;
-        int doorX = PlatformCenterX, doorZ = minZ, doorY = FloorY + 1;
+        Block? stone = sapi.World.GetBlock(new AssetLocation("game", "stonebricks-granite"))
+                    ?? sapi.World.GetBlock(new AssetLocation("game", "rock-granite"));
+        if (stone == null) return;
+        int stoneId = stone.BlockId;
 
         IBulkBlockAccessor ba = sapi.World.GetBlockAccessorBulkUpdate(synchronize: true, relight: true);
-
-        for (int wx = minX; wx <= maxX; wx++)
-        for (int wz = minZ; wz <= maxZ; wz++)
+        for (int dx = -1; dx <= 1; dx++)
+        for (int dy = 0; dy <= 2; dy++)
         {
-            // Floor slab.
-            ba.SetBlock(floorId, new BlockPos(wx, FloorY, wz, PocketDimId));
-
-            if (wz == doorZ && wx >= doorX - 1 && wx <= doorX + 1)
-            {
-                var bottom = new BlockPos(wx, doorY, wz, PocketDimId);
-                if (wx == doorX)
-                {
-                    // The free-standing return door. Only (re)place it when actually missing,
-                    // so a player's open/closed state survives a relog.
-                    if (door != null && sapi.World.BlockAccessor.GetBlock(bottom) is not BlockPocketDoor)
-                        ba.SetBlock(door.BlockId, bottom);
-                }
-                else
-                {
-                    ba.SetBlock(0, bottom);                                   // clear legacy frame post
-                }
-                ba.SetBlock(0, new BlockPos(wx, doorY + 1, wz, PocketDimId)); // clear legacy lintel
-            }
+            int wx = ArchCenterX + dx;
+            int wy = ArchBaseY + dy;
+            bool hole = dx == 0 && dy <= 1;     // centre column, lowest two cells = the doorway
+            ba.SetBlock(hole ? 0 : stoneId, new BlockPos(wx, wy, ArchZ, PocketDimId));
         }
-
-        // The pocket dimension has no skylight, so light it ourselves: stand a lit torch a couple
-        // of blocks in from each corner. Committed through the relighting bulk accessor so block
-        // light propagates across the slab. Only placed when the spot is empty, so a player can
-        // remove them. Spawn (centre) is left clear.
-        if (torch != null)
-        {
-            foreach (var (cx, cz) in new[] { (minX + 2, minZ + 2), (maxX - 2, minZ + 2),
-                                             (minX + 2, maxZ - 2), (maxX - 2, maxZ - 2) })
-            {
-                var tp = new BlockPos(cx, FloorY + 1, cz, PocketDimId);
-                if (sapi.World.BlockAccessor.GetBlock(tp).BlockId == 0)
-                    ba.SetBlock(torch.BlockId, tp);
-            }
-        }
-
         ba.Commit();
+    }
+
+    // Stamp the bosco schematic into the shell once per dimension (guarded by a savegame flag),
+    // aligned to the cube footprint with its base on the floor. Returns the number of blocks placed.
+    private int EnsureBoscoPlaced(bool force = false)
+    {
+        if (sapi == null || PocketDimId < 0) return 0;
+
+        string key = "portals:boscoPlaced-" + PocketDimCode.Path;
+        if (!force && sapi.World.Config.GetBool(key)) return 0;
+
+        BlockSchematic? schem = GetBoscoSchematic();
+        if (schem == null) return 0;
+
+        EnsurePocketChunksLoaded();
+        var origin = new BlockPos(ShellMin, FloorY, ShellMin, PocketDimId);   // (0, 64, 0)
+
+        int placed;
+        try
+        {
+            IBulkBlockAccessor bulk = sapi.World.GetBlockAccessorBulkUpdate(synchronize: true, relight: false);
+            schem.Init(bulk);
+            placed = schem.Place(bulk, sapi.World, origin, EnumReplaceMode.ReplaceAllNoAir, replaceMetaBlocks: true);
+            bulk.Commit();
+            schem.PlaceEntitiesAndBlockEntities(
+                sapi.World.BlockAccessor, sapi.World, origin, schem.BlockCodes, schem.ItemCodes);
+        }
+        catch (Exception e)
+        {
+            Mod.Logger.Error("[Portals] bosco placement threw: {0}", e);
+            return 0;
+        }
+
+        Mod.Logger.Notification(
+            "[Portals] Bosco placement: {0} blocks at ({1},{2},{3}) dim {4}.",
+            placed, origin.X, origin.Y, origin.Z, PocketDimId);
+
+        // 0 placed → the footprint chunks weren't loaded yet; leave the flag unset so a later pass
+        // retries. Otherwise mark done and force a dimension-aware resend so the client sees it.
+        if (placed <= 0) return 0;
+        ResendPocketChunks();
+        sapi.World.Config.SetBool(key, true);
+        return placed;
+    }
+
+    // Force-resend the footprint chunk columns to every player currently in the pocket. The bulk
+    // accessor's own sync is unreliable in this dimension (same family as the relight issue), so
+    // this guarantees the freshly-placed bosco actually shows up client-side.
+    private void ResendPocketChunks()
+    {
+        if (sapi == null || PocketDimId < 0) return;
+        foreach (IPlayer p in sapi.World.AllOnlinePlayers)
+        {
+            if (p is not IServerPlayer sp || sp.Entity == null) continue;
+            if (DimFromInternalY(sp.Entity.Pos.InternalY) != PocketDimId) continue;
+            for (int cx = ShellMin / 32; cx <= ShellMax / 32; cx++)
+            for (int cz = ShellMin / 32; cz <= ShellMax / 32; cz++)
+                sapi.WorldManager.ForceSendChunkColumn(sp, cx, cz, PocketDimId);
+        }
+    }
+
+    private BlockSchematic? GetBoscoSchematic()
+    {
+        if (boscoSchematic != null) return boscoSchematic;
+
+        // "schematics" is not a scanned asset category, so Assets.TryGet won't find it. Try it
+        // anyway (cheap), then fall back to reading the file straight out of the mod folder/zip.
+        string? json = sapi!.Assets.TryGet(BoscoAsset, true)?.ToText() ?? ReadBoscoFromModFile();
+        if (json == null)
+        {
+            Mod.Logger.Warning("[Portals] bosco schematic could not be loaded (asset + mod file both missing).");
+            return null;
+        }
+
+        string err = "";
+        boscoSchematic = BlockSchematic.LoadFromString(json, ref err);
+        if (boscoSchematic == null)
+            Mod.Logger.Warning("[Portals] bosco LoadFromString failed: {0}", err);
+        return boscoSchematic;
+    }
+
+    // Read the schematic directly from this mod's source (folder or packed zip), bypassing the
+    // asset manager — which doesn't index the "schematics" category.
+    private string? ReadBoscoFromModFile()
+    {
+        try
+        {
+            string src = Mod.SourcePath;
+            string rel = "assets/" + Domain + "/schematics/bosco.json";
+
+            if (Directory.Exists(src))   // mod is an unpacked folder
+            {
+                string p = Path.Combine(src, rel.Replace('/', Path.DirectorySeparatorChar));
+                return File.Exists(p) ? File.ReadAllText(p) : null;
+            }
+            if (File.Exists(src))        // mod is a packed .zip
+            {
+                using ZipArchive zip = ZipFile.OpenRead(src);
+                ZipArchiveEntry? entry = zip.GetEntry(rel);
+                if (entry == null) return null;
+                using Stream s = entry.Open();
+                using StreamReader r = new(s);
+                return r.ReadToEnd();
+            }
+        }
+        catch (Exception e)
+        {
+            Mod.Logger.Warning("[Portals] reading bosco from mod file failed: {0}", e.Message);
+        }
+        return null;
     }
 
     private void RegisterPocketDimension(ICoreServerAPI sapi)
@@ -250,15 +403,18 @@ public class PortalsModSystem : ModSystem
         IDimension dim = Manifold!.Registry
             .Define(PocketDimCode)
             .Persistent()
-            .WithWorldgen(new PocketPlatformWorldgen())
+            .WithWorldgen(new PocketShellWorldgen())
             .WithFixedSpawn(PocketSpawn)
             .WithSpawnBehavior(SpawnBehavior.DimensionSpawn)
-            .WithGenerationRadius(1)
-            // Relight up to well above the platform. The default (20) is below our
-            // FloorY (64), so without this the platform blocks never get a relight
-            // pass and the walkable surface stays dark while skylight only reaches
-            // the underside.
-            .WithRelightHeight(FloorY + 16)
+            // Spawn lands in chunk (0,0); radius 2 covers the whole 2×2-chunk shell with margin.
+            .WithGenerationRadius(2)
+            .WithRelightHeight(40)
+            // The pocket keeps its own hotbar + backpack: on entry the player's overworld held items
+            // and backpacks are snapshotted to player save and the (initially empty) pocket set loads,
+            // so they arrive carrying only worn armour/clothing; on exit everything is restored. The
+            // snapshots live in player moddata ("manifold:inv"), so this survives disconnects mid-pocket.
+            // Character (worn equipment) is deliberately left shared — armour/clothes stay on the player.
+            .WithSeparateInventory(ManifoldInventory.Hotbar | ManifoldInventory.Backpack)
             .RegisterStatic();
 
         PocketDimId = dim.InternalId;
@@ -268,10 +424,8 @@ public class PortalsModSystem : ModSystem
 
     private void RegisterDebugCommand(ICoreServerAPI sapi)
     {
-        // /pocket — enter the pocket, recording the player's current spot as the origin so
-        // /back (and the return door) can bring them home. Goes through our own EnterPocket
-        // so the persistent "in pocket" flag is set, exactly like walking through a door.
-        sapi.ChatCommands.Create("pocket")
+        // /pocket — enter, recording the player's current spot as the return origin.
+        var pocket = sapi.ChatCommands.Create("pocket")
             .WithDescription("Teleport into the Portals pocket dimension.")
             .RequiresPrivilege("chat")
             .RequiresPlayer()
@@ -282,11 +436,58 @@ public class PortalsModSystem : ModSystem
                 if (player.Entity.WatchedAttributes.GetBool("portals:inPocket"))
                     return TextCommandResult.Error("You are already in the pocket.");
 
-                EnterPocket(player, player.Entity.Pos.AsBlockPos.Copy(), BlockFacing.NORTH);
+                EnterPocket(player, player.Entity.Pos.AsBlockPos.Copy());
                 return TextCommandResult.Success("Entering the pocket...");
             });
 
-        // /back — manually return to the world (origin, or overworld spawn).
+        // /pocket relight — force a relight of the pocket interior and report light levels.
+        pocket.BeginSubCommand("relight")
+            .WithDescription("Force-relight the pocket interior (debug).")
+            .RequiresPrivilege("chat")
+            .RequiresPlayer()
+            .HandleWith(args =>
+            {
+                if (args.Caller.Player is not IServerPlayer player || player.Entity == null)
+                    return TextCommandResult.Error("No player.");
+                if (DimFromInternalY(player.Entity.Pos.InternalY) != PocketDimId)
+                    return TextCommandResult.Error("You are not in the pocket dimension.");
+
+                BlockPos here = PlayerLocalPos(player);
+                string before = LightReport(here);
+
+                RelightAllSources();
+
+                sapi.World.RegisterCallback(_ =>
+                {
+                    string after = LightReport(here);
+                    sapi.SendMessage(player, 0,
+                        $"[Portals] relight @ {here.X},{here.Y},{here.Z} (dim {PocketDimId})\n  before: {before}\n  after:  {after}",
+                        EnumChatType.Notification);
+                }, 800);
+
+                return TextCommandResult.Success("Relighting...");
+            })
+            .EndSubCommand();
+
+        // /pocket rebuild — force (re)placement of the bosco interior, then relight.
+        pocket.BeginSubCommand("rebuild")
+            .WithDescription("Force re-stamp the bosco interior (debug).")
+            .RequiresPrivilege("chat")
+            .RequiresPlayer()
+            .HandleWith(args =>
+            {
+                if (args.Caller.Player is not IServerPlayer player || player.Entity == null)
+                    return TextCommandResult.Error("No player.");
+                if (DimFromInternalY(player.Entity.Pos.InternalY) != PocketDimId)
+                    return TextCommandResult.Error("You are not in the pocket dimension.");
+
+                int placed = EnsureBoscoPlaced(force: true);
+                sapi.World.RegisterCallback(_ => RelightAllSources(), 500);
+                return TextCommandResult.Success($"Bosco rebuild: {placed} blocks placed.");
+            })
+            .EndSubCommand();
+
+        // /back — return to the world (the way out now that there's no walk-through arch).
         sapi.ChatCommands.Create("back")
             .WithDescription("Return to the world from the Portals pocket dimension.")
             .RequiresPrivilege("chat")
@@ -303,47 +504,31 @@ public class PortalsModSystem : ModSystem
             });
     }
 
-    // ── Plane-crossing detection ─────────────────────────────────────────────
-    // Each tick, sample the segment a player moved along since last tick and look for an
-    // open Pocket Door anywhere on that path. Sampling the path (not just tick endpoints)
-    // catches fast movement that would tunnel past a single-block doorway.
-
-    private const double SampleStep = 0.25;   // blocks between samples along the path
-    private const double MaxScanDist = 8.0;   // longer moves are treated as teleports, skipped
-
-    // Dimensions are stacked in internal Y bands of BlockPos.DimensionBoundary (32768).
-    // EntityPos.Dimension is a derived field that is NOT reliably restored after a relog,
-    // so we always derive the dimension from the authoritative InternalY instead.
-    private static int DimFromInternalY(double internalY) => (int)(internalY / BlockPos.DimensionBoundary);
+    // ── Plane-crossing detection (the return arch) ───────────────────────────
+    private const double SampleStep = 0.25;
+    private const double MaxScanDist = 8.0;
 
     private void OnServerTick(float dt)
     {
         if (Manifold == null || sapi == null) return;
-        IBlockAccessor ba = sapi.World.BlockAccessor;
 
         foreach (IPlayer p in sapi.World.AllOnlinePlayers)
         {
             if (p is not IServerPlayer sp || sp.Entity == null) continue;
 
             EntityPos ep = sp.Entity.Pos;
-            // Work in INTERNAL coordinates (Y carries the dimension band) so we never depend
-            // on the unreliable Pos.Dimension field.
             Vec3d cur = new(ep.X, ep.InternalY, ep.Z);
             int dim = DimFromInternalY(ep.InternalY);
             string uid = sp.PlayerUID;
 
-            // Only scan within a single uninterrupted same-dimension move; a dimension
-            // change means we just teleported them, so reset and skip this tick.
             if (prevState.TryGetValue(uid, out var prev) && prev.dim == dim)
-            {
-                ScanSegment(sp, prev.pos, cur, ba);
-            }
+                ScanSegment(sp, prev.pos, cur);
             prevState[uid] = (cur, dim);
         }
     }
 
-    // a and b carry INTERNAL Y (Y includes the dimension band).
-    private void ScanSegment(IServerPlayer sp, Vec3d a, Vec3d b, IBlockAccessor ba)
+    // a and b carry INTERNAL Y. Looks for the player crossing the arch hole inside the pocket.
+    private void ScanSegment(IServerPlayer sp, Vec3d a, Vec3d b)
     {
         double dx = b.X - a.X, dy = b.Y - a.Y, dz = b.Z - a.Z;
         double horiz = Math.Sqrt(dx * dx + dz * dz);
@@ -356,36 +541,31 @@ public class PortalsModSystem : ModSystem
         {
             double t = (double)i / steps;
 
-            // Sample at mid-cell height (+0.5), then split the internal Y back into a
-            // dimension id + local Y so GetBlock resolves the door in the right dimension.
             int internalY = (int)Math.Floor(a.Y + dy * t + 0.5);
             int dim = internalY / BlockPos.DimensionBoundary;
             int localY = internalY - dim * BlockPos.DimensionBoundary;
+            int x = (int)Math.Floor(a.X + dx * t);
+            int z = (int)Math.Floor(a.Z + dz * t);
 
-            var bp = new BlockPos(
-                (int)Math.Floor(a.X + dx * t),
-                localY,
-                (int)Math.Floor(a.Z + dz * t),
-                dim);
-
-            if (ba.GetBlock(bp) is BlockPocketDoor door && door.IsOpen)
+            if (dim == PocketDimId && IsArchHole(x, localY, z))
             {
-                OnDoorCrossed(sp, bp, door.Facing);
-                return; // at most one crossing per tick
+                OnArchCrossed(sp);
+                return;
             }
         }
     }
 
-    // ── Door crossing → transit ──────────────────────────────────────────────
+    private static bool IsArchHole(int x, int y, int z)
+        => x == ArchCenterX && z == ArchZ && (y == ArchBaseY || y == ArchBaseY + 1);
 
-    public void OnDoorCrossed(IServerPlayer player, BlockPos doorPos, BlockFacing facing)
+    private void OnArchCrossed(IServerPlayer player)
     {
         if (Manifold == null || sapi == null || player.Entity == null) return;
+        if (!player.Entity.WatchedAttributes.GetBool("portals:inPocket")) return;
 
         string uid = player.PlayerUID;
         long now = sapi.World.ElapsedMilliseconds;
 
-        // Debounce one walk-through into one transit (see field comment).
         bool samePass = lastInsideMs.TryGetValue(uid, out long last) && (now - last) < ContinuousPassGapMs;
         lastInsideMs[uid] = now;
         if (samePass)
@@ -398,37 +578,34 @@ public class PortalsModSystem : ModSystem
         }
         triggeredThisPass.Add(uid);
 
-        // We decide entry vs return from our own persistent flag, never the engine's
-        // dimension (which isn't restored on relog). In the pocket → go home; otherwise →
-        // go in, recording this door as the origin.
-        if (player.Entity.WatchedAttributes.GetBool("portals:inPocket"))
-        {
-            ReturnFromPocket(player);
-        }
-        else
-        {
-            EnterPocket(player, doorPos, facing);
-        }
+        ReturnFromPocket(player);
     }
 
-    // origin is the world position to come back to (the entry door, or the player's spot
-    // for /pocket). Stored in watched attributes, which persist across save/relog.
-    private void EnterPocket(IServerPlayer player, BlockPos origin, BlockFacing facing)
+    // ── Entry / return ───────────────────────────────────────────────────────
+
+    /// <summary>Called by the painting block when a player right-clicks it.</summary>
+    public void EnterPocketViaPainting(IServerPlayer player, BlockPos paintingPos, BlockFacing facing)
+    {
+        if (Manifold == null || player.Entity == null) return;
+        if (player.Entity.WatchedAttributes.GetBool("portals:inPocket")) return;
+
+        // Record where the player is standing so the return drops them back exactly where they left.
+        EnterPocket(player, player.Entity.Pos.AsBlockPos.Copy());
+    }
+
+    private void EnterPocket(IServerPlayer player, BlockPos origin)
     {
         var wa = player.Entity.WatchedAttributes;
         wa.SetInt("portals:returnX", origin.X);
         wa.SetInt("portals:returnY", origin.Y);
         wa.SetInt("portals:returnZ", origin.Z);
-        wa.SetInt("portals:returnFacing", facing.Index);
         wa.SetBool("portals:inPocket", true);
 
-        Mod.Logger.Notification("[Portals] EnterPocket uid={0} origin=({1},{2},{3}) facing={4}",
-            player.PlayerUID, origin.X, origin.Y, origin.Z, facing.Code);
+        Mod.Logger.Notification("[Portals] EnterPocket uid={0} origin=({1},{2},{3})",
+            player.PlayerUID, origin.X, origin.Y, origin.Z);
 
-        // Empty options → the dimension's own SpawnBehavior (DimensionSpawn) applies,
-        // landing the player on the platform spawn (centre). Manifold force-sends the chunks
-        // as part of this transit, but we still schedule the same post-transit door repair as
-        // the relog path so a first-entry door can't arrive client-desynced and inert.
+        // DimensionSpawn lands the player at the fixed spawn. Manifold force-sends the chunks; the
+        // repair pass places the bosco interior (first time) and relights.
         Manifold!.Transitions.TeleportPlayer(player, PocketDimCode, new TransitionOptions());
         SchedulePocketRepair();
         sapi!.SendMessage(player, 0, "You step through into the pocket.", EnumChatType.Notification);
@@ -447,8 +624,8 @@ public class PortalsModSystem : ModSystem
         Mod.Logger.Notification("[Portals] ReturnFromPocket uid={0} origin=({1},{2},{3}) hasOrigin={4}",
             player.PlayerUID, rx, ry, rz, hasOrigin);
 
-        // Step 1: ensure the player is in the overworld dimension (loads chunks). This also
-        // recovers the relog case where the engine has lost the player's dimension.
+        // Step 1: ensure the player is in the overworld dimension (loads chunks). Also recovers the
+        // relog case where the engine has lost the player's dimension.
         Manifold!.Transitions.TeleportPlayer(player, OverworldCode, new TransitionOptions());
 
         if (!hasOrigin)
@@ -457,21 +634,16 @@ public class PortalsModSystem : ModSystem
             return;
         }
 
-        // Step 2: place the player exactly, one block in front of the origin. We do this
-        // explicitly (not via OverridePosition) because the transit above is a no-op when
-        // the engine already believes the player is in the overworld (post-relog), in which
-        // case OverridePosition is ignored and the player ends up off-map.
-        BlockFacing facing = BlockFacing.ALLFACES[wa.GetInt("portals:returnFacing")];
-        double lx = rx + facing.Normali.X + 0.5;
-        double ly = ry;
-        double lz = rz + facing.Normali.Z + 0.5;
-
+        // Step 2: place the player back exactly where they entered from. Explicit (not via
+        // OverridePosition) because the transit is a no-op when the engine already believes the
+        // player is in the overworld (post-relog), in which case OverridePosition is ignored.
+        double lx = rx + 0.5, ly = ry, lz = rz + 0.5;
         sapi!.World.RegisterCallback(_ =>
         {
             if (player.Entity == null) return;
             player.Entity.TeleportToDouble(lx, ly, lz);
         }, 300);
 
-        sapi.SendMessage(player, 0, "You step back through the door.", EnumChatType.Notification);
+        sapi.SendMessage(player, 0, "You step back through the arch.", EnumChatType.Notification);
     }
 }

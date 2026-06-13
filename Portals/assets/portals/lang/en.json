@@ -1,4 +1,7 @@
 {
 	"portals:modname": "Portals",
-	"block-pocketdoor-*": "Pocket Door"
+	"block-painting-storditishut-north": "Storditi's hut",
+	"block-painting-storditishut-east": "Storditi's hut",
+	"block-painting-storditishut-south": "Storditi's hut",
+	"block-painting-storditishut-west": "Storditi's hut"
 }
