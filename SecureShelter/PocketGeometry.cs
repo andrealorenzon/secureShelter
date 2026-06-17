@@ -46,35 +46,35 @@ public sealed class PocketGeometry
         if (boscoSizeY <= 0) boscoSizeY = 30;
         if (boscoSizeZ <= 0) boscoSizeZ = 40;
 
-        int t = Math.Max(0, cfg.WrapperThickness);
-        int min = Math.Max(1, cfg.MinBoxSize);
+        int t = Math.Max(0, SecureShelterConfig.WrapperThickness);
+        int min = Math.Max(1, SecureShelterConfig.MinBoxSize);
         int boxX = Math.Max(boscoSizeX, min);
         int boxZ = Math.Max(boscoSizeZ, min);
 
         // World position of the box's min corner. The box would otherwise generate at the dimension's
         // (0,0) corner, where its outer dirt wall (at -1) falls off the map and gets cut — so it's
         // shifted into positive coordinates. Spawn/arch are relative to the box and move with it.
-        int ox = cfg.BoxOriginX, oz = cfg.BoxOriginZ;
+        int ox = SecureShelterConfig.BoxOriginX, oz = SecureShelterConfig.BoxOriginZ;
 
         var g = new PocketGeometry
         {
-            DimCode = new AssetLocation(SecureShelterModSystem.Domain, cfg.PocketDimensionCode),
-            FloorY = cfg.FloorY,
+            DimCode = new AssetLocation(SecureShelterModSystem.Domain, SecureShelterConfig.PocketDimensionCode),
+            FloorY = SecureShelterConfig.FloorY,
 
             ShellMinX = ox,
             ShellMaxX = ox + boxX - 1,
             ShellMinZ = oz,
             ShellMaxZ = oz + boxZ - 1,
-            ShellTopY = cfg.FloorY + boscoSizeY - 1 + Math.Max(0, cfg.CeilingHeadroom),
+            ShellTopY = SecureShelterConfig.FloorY + boscoSizeY - 1 + Math.Max(0, SecureShelterConfig.CeilingHeadroom),
 
             // Centre the bosco in the (possibly larger) footprint.
             BoscoOriginX = ox + (boxX - boscoSizeX) / 2,
             BoscoOriginZ = oz + (boxZ - boscoSizeZ) / 2,
 
-            ShellBlockCode = cfg.ShellBlockCode,
-            ShellBlockFallback = cfg.ShellBlockFallback,
-            WrapperBlockCode = cfg.WrapperBlockCode,
-            ArchBlockCode = cfg.ArchBlockCode,
+            ShellBlockCode = SecureShelterConfig.ShellBlockCode,
+            ShellBlockFallback = SecureShelterConfig.ShellBlockFallback,
+            WrapperBlockCode = SecureShelterConfig.WrapperBlockCode,
+            ArchBlockCode = SecureShelterConfig.ArchBlockCode,
         };
 
         g.DirtMinX = g.ShellMinX - t;
@@ -91,13 +91,13 @@ public sealed class PocketGeometry
             var m = archMarker.Value;     // schematic-relative position of the marker
             g.ArchCenterX = Math.Clamp(g.BoscoOriginX + m.X, g.ShellMinX + 2, g.ShellMaxX - 2);
             g.ArchZ       = Math.Clamp(g.BoscoOriginZ + m.Z, g.ShellMinZ + 1, g.ShellMaxZ - 1);
-            g.ArchBaseY   = cfg.FloorY + m.Y;     // schematic is placed with its base at FloorY
+            g.ArchBaseY   = SecureShelterConfig.FloorY + m.Y;     // schematic is placed with its base at FloorY
         }
         else
         {
             g.ArchCenterX = Math.Clamp(ox + cfg.SpawnX + cfg.ArchOffsetX, g.ShellMinX + 2, g.ShellMaxX - 2);
             g.ArchZ       = g.ShellMaxZ - Math.Max(1, cfg.ArchWallInset);
-            g.ArchBaseY   = cfg.FloorY + cfg.SpawnHeightAboveFloor;
+            g.ArchBaseY   = SecureShelterConfig.FloorY + cfg.SpawnHeightAboveFloor;
         }
 
         // Arrival always matches the return arch, nudged 4 blocks north (+Z) so the player doesn't

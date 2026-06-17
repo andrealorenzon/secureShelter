@@ -18,7 +18,9 @@ Built on the **Manifold** dimension library — see [manifold.md](manifold.md).
 ## Behaviour
 
 1. Craft or place the **Storditi's hut** painting (it orients to the wall face you place it on).
-2. Right-click the painting → you arrive on the floor of the pocket, in front of the return arch.
+2. Right-click the painting **while holding the component bag** (`secureshelter:securesheltercomponents`)
+   → you arrive on the floor of the pocket, in front of the return arch. The bag is a key: it must be
+   in your active hand and is **not** consumed. Without it, the painting refuses with a message.
 3. The pocket is a sealed room holding a pre-built interior (the "bosco"). It's a safe zone:
    nothing can hurt you, nothing spawns, and you can't break or place blocks.
 4. Walk through the **return arch** → you arrive back at the exact spot you entered from.
@@ -98,10 +100,12 @@ straight from the mod's source folder/zip (`ReadBoscoFromModFile`).
 ## Round trip
 
 **Entry** (`EnterPocketViaPainting` → `EnterPocket`). The painting forwards the right-click to
-the mod system, which records the player's current `x/y/z` and sets the persistent watched
-attribute `secureshelter:inPocket = true`, then `TeleportPlayer(..., PocketDimCode, new
-TransitionOptions())`. `DimensionSpawn` lands them on the fixed spawn. A repair pass then
-places the bosco (first time), stamps the arch, discovers refillables, and relights.
+the mod system, which first checks the player is holding the component bag (`HasComponentsKey`;
+the active hand slot only, never consumed) — no key, no entry. Otherwise it records the player's
+current `x/y/z`, sets the persistent watched attribute `secureshelter:inPocket = true`, then
+`TeleportPlayer(..., PocketDimCode, new TransitionOptions())`. `DimensionSpawn` lands them on the
+fixed spawn. A repair pass then places the bosco (first time), stamps the arch, and discovers
+refillables. (`/pocket` enters without the key — it's a debug command.)
 
 **Return** (arch crossing → `ReturnFromPocket`). A per-tick listener (`OnServerTick`) samples
 each player's movement *segment* (`ScanSegment`, step 0.25, mid-cell `+0.5`) so a fast walk
@@ -160,14 +164,16 @@ Manifold relights generated columns at generation time up to `RelightHeight`. Th
 keeps `FloorY` low and sets `RelightHeight` to clear the whole sealed box, and the bosco/arch
 are placed through **relighting** bulk accessors, so the interior is lit. Two subtleties:
 
-- **Block-entity light sources need a post-placement relight.** The bulk-accessor relight runs
-  on `Commit()`, which happens *before* `PlaceEntitiesAndBlockEntities`. Block-type light
-  (torches, lanterns — `LightHsv` on the block) is included; light that comes from a block
-  *entity* (e.g. oil lamps) is not, because the BE doesn't exist yet at Commit. So those
-  sources arrive dark on first entry and only a relog "fixed" it (the reload recomputed light
-  with the BEs present). The fix: `RelightPocket()` calls `WorldManager.FullRelight` over the
-  whole box **after** the BEs are placed — wired into `EnsureBoscoPlaced` and repeated in the
-  `SchedulePocketRepair` passes (so a BE that needs a tick to register still gets caught).
+- **Use only static-light blocks in the interior.** Light that lives on the block's `LightHsv`
+  (torches, lanterns, firepits, wall-mounted oil-lamp blocks) is computed by the placement
+  relight and works. Light that is injected dynamically by a *block entity* — most importantly
+  **ground-storage oil lamps**, where `BlockGroundStorage.GetLightHsv` reads the lit contents and
+  the BE publishes it via `ExchangeBlock` — does **not** propagate in a Manifold custom dimension.
+  This was tested exhaustively: `MarkBlockDirty`, `ExchangeBlock`, and `WorldManager.FullRelight`
+  all leave the lamp cell at 0 block-light (only ambient spill from nearby static lights shows). It
+  appears to be an engine/Manifold limitation on runtime block-entity light in non-overworld
+  dimensions. So build the bosco's lighting from static-light blocks; don't rely on ground-stored
+  lamps.
 - **Geometry/relight-height changes only affect freshly generated chunks** — Manifold caches
   columns and never regenerates, and there's no purge/reset in 0.4.x. To force a regen: new
   world, or bump `PocketDimensionCode` (a new dimension code = a fresh dimension).

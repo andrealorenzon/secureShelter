@@ -101,7 +101,7 @@ public class SecureShelterModSystem : ModSystem
 
         // Load the interior schematic up front so its measured size can drive the cube geometry, and
         // pull out the arch-marker block (if any) so its position becomes the return arch.
-        boscoAsset = new AssetLocation(Domain, config.BoscoSchematicPath);
+        boscoAsset = new AssetLocation(Domain, SecureShelterConfig.BoscoSchematicPath);
         BlockSchematic? schem = GetBoscoSchematic();
         (int X, int Y, int Z)? archMarker = schem != null ? FindAndStripArchMarker(schem) : null;
         geo = PocketGeometry.Build(config, schem?.SizeX ?? 0, schem?.SizeY ?? 0, schem?.SizeZ ?? 0, archMarker);
@@ -197,10 +197,10 @@ public class SecureShelterModSystem : ModSystem
     }
 
     // Player may interact with these (take liquid/food, cut cheese/pie, ground-storage bowls).
-    private bool IsUsableContainerPath(string path) => MatchesAnyPrefix(path, config.UsableContainerPrefixes);
+    private bool IsUsableContainerPath(string path) => MatchesAnyPrefix(path, SecureShelterConfig.UsableContainerPrefixes);
 
     // Containers/blocks whose contents we keep topped up (incl. cheese/pie slice regrowth).
-    private bool IsRefillablePath(string path) => MatchesAnyPrefix(path, config.RefillableBlockPrefixes);
+    private bool IsRefillablePath(string path) => MatchesAnyPrefix(path, SecureShelterConfig.RefillableBlockPrefixes);
 
     private static bool MatchesAnyPrefix(string path, string[]? prefixes)
     {
@@ -506,28 +506,15 @@ public class SecureShelterModSystem : ModSystem
             sapi.WorldManager.LoadChunkColumnForDimension(cx, cz, PocketDimId);
     }
 
-    // After a transit into the pocket: place the bosco interior (once) and stamp the return arch
-    // over it. Lighting is handled natively now — the interior sits inside the relight band (low
-    // FloorY + WithRelightHeight) and both the bosco and the arch are placed through relighting
-    // bulk accessors — so there is no longer a manual relight pass.
-    //
-    // First-entry darkness fix: EnsureBoscoPlaced resends the footprint immediately after it stamps
-    // the interior, but that resend races the post-placement relight and (because EnsureBoscoPlaced
-    // early-returns once the place-once flag is set) never repeats — so on the very first entry the
-    // client keeps the dark, pre-relight chunks until a relog reloads lit ones. The extra resend
-    // passes below push the settled, lit chunk state to the client a beat later, with no relog
-    // needed. ResendPocketChunks / StampArch are both idempotent.
+    // After a transit into the pocket: place the bosco interior (once), stamp the return arch over it,
+    // and snapshot refillables. Lighting is handled natively — the interior sits inside the relight band
+    // (low FloorY + WithRelightHeight) and the bosco and arch are placed through relighting bulk
+    // accessors. Two staggered passes because the footprint chunks may not all be loaded on the first.
     private void SchedulePocketRepair()
     {
         if (sapi == null) return;
         sapi.World.RegisterCallback(_ => { EnsureBoscoPlaced(); StampArch(); DiscoverRefillables(); }, 2000);
         sapi.World.RegisterCallback(_ => { EnsureBoscoPlaced(); StampArch(); DiscoverRefillables(); }, 3500);
-        // Relight + resend after the block entities have settled, independent of the place-once
-        // guard. The place-time relight runs on bulk.Commit() — BEFORE PlaceEntitiesAndBlockEntities
-        // — so block-entity-driven light sources (oil lamps) are missing from it and arrive dark on
-        // first entry. A full cuboid relight with the BEs present fixes them without needing a relog.
-        sapi.World.RegisterCallback(_ => { StampArch(); RelightPocket(); }, 5000);
-        sapi.World.RegisterCallback(_ => RelightPocket(), 8000);
     }
 
     // (Re)build the return arch idempotently via a relighting bulk accessor. Stamped after the bosco
@@ -596,10 +583,9 @@ public class SecureShelterModSystem : ModSystem
             placed, origin.X, origin.Y, origin.Z, PocketDimId);
 
         // 0 placed → the footprint chunks weren't loaded yet; leave the flag unset so a later pass
-        // retries. Otherwise mark done and relight (the block entities are now placed, so any
-        // BE-driven light source — oil lamps — is finally accounted for) + resend to the client.
+        // retries. Otherwise mark done and force a dimension-aware resend so the client sees it.
         if (placed <= 0) return 0;
-        RelightPocket();
+        ResendPocketChunks();
         sapi.World.Config.SetBool(key, true);
         return placed;
     }
@@ -609,7 +595,7 @@ public class SecureShelterModSystem : ModSystem
     // there instead. Returns null if no marker is present.
     private (int X, int Y, int Z)? FindAndStripArchMarker(BlockSchematic schem)
     {
-        string code = config.ArchMarkerBlockCode;
+        string code = SecureShelterConfig.ArchMarkerBlockCode;
         if (string.IsNullOrEmpty(code)) return null;
 
         int markerId = -1;
@@ -656,16 +642,11 @@ public class SecureShelterModSystem : ModSystem
         }
     }
 
-    // Fully relight the sealed box (after the bosco's block entities are placed) and resend the
-    // affected columns. Unlike the bulk-accessor relight on Commit — which runs before the block
-    // entities exist and so misses BE-driven light (oil lamps) — FullRelight recomputes the whole
-    // cuboid with everything present. Covers the dirt-wrapped footprint so no source is clipped.
-    private void RelightPocket()
+    // Entry requires the player to be holding the components item in hand — a key, never consumed.
+    private bool HasComponentsKey(IServerPlayer player)
     {
-        if (sapi == null || PocketDimId < 0) return;
-        var min = new BlockPos(geo.DirtMinX, geo.DirtBottomY, geo.DirtMinZ, PocketDimId);
-        var max = new BlockPos(geo.DirtMaxX, geo.DirtTopY, geo.DirtMaxZ, PocketDimId);
-        sapi.WorldManager.FullRelight(min, max, sendToClients: true);
+        AssetLocation? code = player.InventoryManager?.ActiveHotbarSlot?.Itemstack?.Collectible?.Code;
+        return code != null && code.Domain == Domain && code.Path == "securesheltercomponents";
     }
 
     private BlockSchematic? GetBoscoSchematic()
@@ -695,11 +676,11 @@ public class SecureShelterModSystem : ModSystem
     // ends up in a re-exported bosco.
     private void StripBannedBlocks(BlockSchematic schem)
     {
-        if (config.BannedBlockPrefixes == null || config.BannedBlockPrefixes.Length == 0) return;
+        if (SecureShelterConfig.BannedBlockPrefixes == null || SecureShelterConfig.BannedBlockPrefixes.Length == 0) return;
 
         var bannedIds = new HashSet<int>();
         foreach (var kv in schem.BlockCodes)
-            if (MatchesAnyPrefix(kv.Value?.Path ?? "", config.BannedBlockPrefixes)) bannedIds.Add(kv.Key);
+            if (MatchesAnyPrefix(kv.Value?.Path ?? "", SecureShelterConfig.BannedBlockPrefixes)) bannedIds.Add(kv.Key);
         if (bannedIds.Count == 0) return;
 
         var removed = new HashSet<uint>();
@@ -736,7 +717,7 @@ public class SecureShelterModSystem : ModSystem
         try
         {
             string src = Mod.SourcePath;
-            string rel = "assets/" + Domain + "/" + config.BoscoSchematicPath;
+            string rel = "assets/" + Domain + "/" + SecureShelterConfig.BoscoSchematicPath;
 
             if (Directory.Exists(src))   // mod is an unpacked folder
             {
@@ -963,6 +944,14 @@ public class SecureShelterModSystem : ModSystem
     {
         if (Manifold == null || player.Entity == null) return;
         if (player.Entity.WatchedAttributes.GetBool("secureshelter:inPocket")) return;
+
+        // Entry requires the components item held in hand as a key (not consumed).
+        if (!HasComponentsKey(player))
+        {
+            sapi!.SendMessage(player, 0,
+                "You need the Secure Shelter components to step through the painting.", EnumChatType.Notification);
+            return;
+        }
 
         // Record where the player is standing so the return drops them back exactly where they left.
         EnterPocket(player, player.Entity.Pos.AsBlockPos.Copy());
