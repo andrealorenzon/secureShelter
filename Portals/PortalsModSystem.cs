@@ -10,6 +10,7 @@ using Vintagestory.API.Common.Entities;
 using Vintagestory.API.Datastructures;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
+using Vintagestory.GameContent;
 
 namespace Portals;
 
@@ -17,42 +18,21 @@ public class PortalsModSystem : ModSystem
 {
     // ── Identity ─────────────────────────────────────────────────────────────
     public const string Domain = "portals";
+    private const string ConfigFile = "PortalsConfig.json";
 
-    // Bumped whenever the dimension's baked-in layout changes — Manifold caches generated columns
-    // and won't regenerate in place, so a new code forces a fresh dimension.
-    // pocket5: bosco interior. pocket6: build lowered to floor y=1 so it sits inside the relight band.
-    public static readonly AssetLocation PocketDimCode = new(Domain, "pocket6");
     public static readonly AssetLocation OverworldCode = new("manifold", "overworld");
 
-    // ── Pocket geometry (dimension-local coordinates) ────────────────────────
-    // A hollow 40×40×40 shell of mantle: x/z span ShellMin..ShellMax, y spans FloorY..ShellTopY.
-    public const int FloorY = 1;                // kept low so the whole build fits the relight band
-    public const int ShellMin = 0;
-    public const int ShellMax = 39;             // 40 blocks (0..39)
-    public const int ShellTopY = FloorY + 39;   // 40 → 40 tall
+    // Loaded from ModConfig/PortalsConfig.json; all concrete coordinates live in `geo`, which is
+    // computed from this config plus the bosco schematic's measured size (so the shell wraps it
+    // exactly). Both are resolved in StartServerSide before the dimension is registered.
+    private PortalsConfig config = null!;
+    private PocketGeometry geo = null!;
 
-    // Mantle has no light absorption, so light leaks straight through the shell. We wrap it in a
-    // 42×42×42 opaque dirt box (one block out on every side) to seal the interior.
-    public const int DirtMin = ShellMin - 1;    // -1
-    public const int DirtMax = ShellMax + 1;    // 40  → 42 blocks (-1..40)
-    public const int DirtBottomY = FloorY - 1;  // 0
-    public const int DirtTopY = ShellTopY + 1;  // 41 → 42 tall
+    /// <summary>The pocket dimension code (from config). Bumped via config when the layout changes.</summary>
+    private AssetLocation PocketDimCode => geo.DimCode;
 
-    // Fixed spawn inside the bosco interior, raised 8 m above the floor so the player lands on the
-    // forest surface rather than inside the terrain. (4th arg dimension 0; Manifold rebases it.)
-    public const int SpawnX = 19;
-    public const int SpawnZ = 31;
-    public static readonly BlockPos PocketSpawn = new(SpawnX, FloorY + 8, SpawnZ, 0);   // y = 9
-
-    // Return arch: a free-standing 3×3 stone wall with a 1-wide × 2-tall walk-through hole, a few
-    // blocks behind the spawn (so the player faces into the forest), at the spawn's standing height.
-    public const int ArchCenterX = SpawnX;          // 19
-    public const int ArchZ = SpawnZ + 4;            // 35 — behind the spawn
-    public const int ArchBaseY = FloorY + 8;        // 9 — floor of the hole, level with the spawn
-    // Hole cells: (ArchCenterX, ArchBaseY, ArchZ) and (ArchCenterX, ArchBaseY+1, ArchZ).
-
-    // The pre-built interior (a 40×40×30 forest), placed once into the shell on first entry.
-    private static readonly AssetLocation BoscoAsset = new(Domain, "schematics/bosco.json");
+    // The pre-built interior (a forest), placed once into the shell on first entry.
+    private AssetLocation boscoAsset = null!;
     private BlockSchematic? boscoSchematic;
 
     /// <summary>Server-side Manifold facade, resolved in <see cref="StartServerSide"/>.</summary>
@@ -63,10 +43,6 @@ public class PortalsModSystem : ModSystem
 
     private ICoreServerAPI? sapi;
 
-    // A throwaway solid block used to force the engine's real relight (see ForceRelight): placing
-    // then removing it is what a player does manually with a light to "fix" the lighting.
-    private int tempBlockId;
-
     // Walk-through debounce: the per-tick scan can report a player inside the arch hole on many
     // consecutive ticks, so we collapse one continuous pass into a single transit.
     private const long ContinuousPassGapMs = 300;
@@ -75,6 +51,28 @@ public class PortalsModSystem : ModSystem
 
     // Per-player previous feet position + dimension, for the plane-crossing scan.
     private readonly Dictionary<string, (Vec3d pos, int dim)> prevState = new();
+
+    // Players currently mounted (e.g. sleeping in a bed); used to detect waking in the pocket.
+    private readonly HashSet<string> mountedUids = new();
+
+    // Pocket-local position where each player lay down to sleep, so they wake right at that bed.
+    private readonly Dictionary<string, BlockPos> sleepReturnPos = new();
+
+    // Snapshots of refillable blocks (barrels / jugs / vessels / crocks / firepits) in the pocket,
+    // keyed by position: the block id plus its block-entity tree (if any), captured full/lit and
+    // restored every refill tick. Block id is kept too so a firepit that burns down to its cold
+    // variant is set back to the lit block.
+    private readonly Dictionary<BlockPos, (int blockId, byte[]? tree)> refillBackups = new();
+
+    // Blocks with a rebuild already queued (debounce, so repeated takes collapse to one rebuild).
+    private readonly HashSet<BlockPos> pendingRebuild = new();
+
+    // How long after a player takes from a managed block before it's rebuilt.
+    private const int RebuildDelayMs = 20000;
+
+    // Firewood a pocket firepit's fuel slot is topped up to on entry, so the fire stays lit for a
+    // long time without any polling (see DiscoverRefillables).
+    private const int FirepitFuelRefill = 32;
 
     // Consumer mods must load after Manifold's own order (0.05).
     public override double ExecuteOrder() => 0.5;
@@ -99,7 +97,18 @@ public class PortalsModSystem : ModSystem
             return;
         }
 
-        tempBlockId = sapi.World.GetBlock(new AssetLocation("game", "rock-granite"))?.BlockId ?? 0;
+        LoadConfig(sapi);
+
+        // Load the interior schematic up front so its measured size can drive the cube geometry, and
+        // pull out the arch-marker block (if any) so its position becomes the return arch.
+        boscoAsset = new AssetLocation(Domain, config.BoscoSchematicPath);
+        BlockSchematic? schem = GetBoscoSchematic();
+        (int X, int Y, int Z)? archMarker = schem != null ? FindAndStripArchMarker(schem) : null;
+        geo = PocketGeometry.Build(config, schem?.SizeX ?? 0, schem?.SizeY ?? 0, schem?.SizeZ ?? 0, archMarker);
+        Mod.Logger.Notification(
+            "[Portals] Cube geometry: footprint x[{0}..{1}] z[{2}..{3}] y[{4}..{5}], spawn ({6},{7},{8}), relight {9}.",
+            geo.ShellMinX, geo.ShellMaxX, geo.ShellMinZ, geo.ShellMaxZ, geo.FloorY, geo.ShellTopY,
+            geo.SpawnX, geo.SpawnY, geo.SpawnZ, geo.RelightHeight);
 
         RegisterPocketDimension(sapi);
         RegisterDebugCommand(sapi);
@@ -113,109 +122,319 @@ public class PortalsModSystem : ModSystem
             prevState.Remove(uid);
             lastInsideMs.Remove(uid);
             triggeredThisPass.Remove(uid);
+            mountedUids.Remove(uid);
+            sleepReturnPos.Remove(uid);
         };
 
         sapi.Event.PlayerNowPlaying += OnPlayerNowPlaying;
 
-        // Manifold doesn't relight block light in a dimension via the FullRelight / bulk-accessor
-        // APIs (confirmed: they leave light at 0). The ONLY path that works is the engine's normal
-        // block place/break relight. So when a player edits a block in the pocket, we replicate the
-        // "place a block then pick it up" fix near them (see ForceRelight).
-        sapi.Event.DidPlaceBlock += (player, oldId, blockSel, stack) => RelightAroundPlayer(player);
-        sapi.Event.DidBreakBlock += (player, oldId, blockSel) => RelightAroundPlayer(player);
+        // Keep the pocket permanently dry (see OnPocketGetClimate).
+        ((IEventAPI)sapi.Event).OnGetClimate += OnPocketGetClimate;
+
+        // Make the pocket a safe zone — no HP loss while inside (see HookInvulnerability).
+        sapi.Event.PlayerNowPlaying += HookInvulnerability;
+
+        // Static-dimension protections (all scoped to THIS pocket only — see the handlers).
+        sapi.Event.CanPlaceOrBreakBlock += OnCanPlaceOrBreak;   // no breaking/placing blocks
+        sapi.Event.CanUseBlock += OnCanUseBlock;                // doors free; loot locked bar barrels/vessels
+        sapi.Event.OnTrySpawnEntity += OnPocketTrySpawnEntity;  // no natural spawns (no enemies)
+        sapi.Event.DidUseBlock += OnDidUseBlock;                // refill a managed block ~20s after a take
+        sapi.Event.RegisterGameTickListener(OnDropSweep, 1000);          // can't drop items
+
+        // Animals in the pocket are unkillable (hooked when they spawn or load there).
+        ((IEventAPI)sapi.Event).OnEntitySpawn += HookEntityInvulnerability;
+        ((IEventAPI)sapi.Event).OnEntityLoaded += HookEntityInvulnerability;
+    }
+
+    // ── Static-dimension protections (this pocket only — every check keys off PocketDimId, so
+    //    other dimensions this mod may add later are unaffected) ──────────────────────────────
+
+    private bool IsPocketInternalY(double internalY) => PocketDimId >= 0 && DimFromInternalY(internalY) == PocketDimId;
+    private bool IsPlayerInPocket(IServerPlayer? p) => p?.Entity != null && IsPocketInternalY(p.Entity.Pos.InternalY);
+
+    // No breaking or placing blocks inside the pocket — it's static.
+    private bool OnCanPlaceOrBreak(IServerPlayer byPlayer, BlockSelection blockSel, out string claimant)
+    {
+        claimant = null!;
+        if (!IsPlayerInPocket(byPlayer)) return true;   // not this pocket → no objection
+        if (IsBowlEdit(byPlayer, blockSel)) return true; // exception: bowls may be placed/picked up
+        claimant = "Portals";
+        return false;
+    }
+
+    // Doors and harmless interactions stay free. Whitelisted containers (barrels, jugs/jars, vessels,
+    // crocks, firepit cooking pots, shelves, cheese/pie, chests, ground storage) are usable. Every
+    // other container is locked, so nothing can be stolen.
+    private bool OnCanUseBlock(IServerPlayer byPlayer, BlockSelection blockSel)
+    {
+        if (!IsPlayerInPocket(byPlayer) || blockSel?.Position == null) return true;
+
+        BlockEntity? be = sapi!.World.BlockAccessor.GetBlockEntity(blockSel.Position);
+        if (be is not IBlockEntityContainer) return true;   // not a container (doors, levers, jugs w/o BE …)
+
+        string path = sapi.World.BlockAccessor.GetBlock(blockSel.Position).Code?.Path ?? "";
+        if (IsUsableContainerPath(path))
+        {
+            // Capture full state before the take. Ground storage is excluded: only the schematic's
+            // own ground storage (snapshotted at entry by DiscoverRefillables — e.g. the apples)
+            // refills; bowls a player puts down later must stay theirs to keep/move.
+            if (IsRefillablePath(path) && !path.StartsWith("groundstorage"))
+                SnapshotRefillable(blockSel.Position);
+            return true;
+        }
+        return false;                                        // locked container
+    }
+
+    // Bowls (incl. meal-filled bowls) may be placed from hand or picked up off a table (ground
+    // storage) — the only block edit allowed in the pocket.
+    private bool IsBowlEdit(IServerPlayer byPlayer, BlockSelection? blockSel)
+    {
+        string held = byPlayer.InventoryManager?.ActiveHotbarSlot?.Itemstack?.Collectible?.Code?.Path ?? "";
+        if (held.StartsWith("bowl")) return true;
+        if (blockSel?.Position == null) return false;
+        string tgt = sapi!.World.BlockAccessor.GetBlock(blockSel.Position).Code?.Path ?? "";
+        return tgt.StartsWith("bowl") || tgt.StartsWith("groundstorage");
+    }
+
+    // Player may interact with these (take liquid/food, cut cheese/pie, ground-storage bowls).
+    private bool IsUsableContainerPath(string path) => MatchesAnyPrefix(path, config.UsableContainerPrefixes);
+
+    // Containers/blocks whose contents we keep topped up (incl. cheese/pie slice regrowth).
+    private bool IsRefillablePath(string path) => MatchesAnyPrefix(path, config.RefillableBlockPrefixes);
+
+    private static bool MatchesAnyPrefix(string path, string[]? prefixes)
+    {
+        if (string.IsNullOrEmpty(path) || prefixes == null) return false;
+        foreach (string p in prefixes)
+            if (!string.IsNullOrEmpty(p) && path.StartsWith(p, StringComparison.Ordinal)) return true;
+        return false;
+    }
+
+    // No natural spawns in the pocket — covers every enemy and keeps the dimension static.
+    private bool OnPocketTrySpawnEntity(IBlockAccessor blockAccessor, ref EntityProperties properties, Vec3d spawnPosition, long herdId)
+        => !IsPocketInternalY(spawnPosition.Y);
+
+    // Find all refillable blocks in the pocket and snapshot their full/lit state. Walks only the
+    // footprint chunks' block-entity lists (a handful of chunks), not the whole volume. Run during
+    // the post-entry repair pass, when the bosco has just been (re)placed and everything is full.
+    private void DiscoverRefillables()
+    {
+        if (sapi == null || PocketDimId < 0) return;
+
+        int cxMin = FloorDiv(geo.ShellMinX, 32), cxMax = FloorDiv(geo.ShellMaxX, 32);
+        int czMin = FloorDiv(geo.ShellMinZ, 32), czMax = FloorDiv(geo.ShellMaxZ, 32);
+
+        // Probe one block in each chunk-Y layer the build spans; GetChunk(BlockPos) resolves the
+        // dimension from the position. SnapshotRefillable is idempotent, so revisiting is harmless.
+        for (int cx = cxMin; cx <= cxMax; cx++)
+        for (int cz = czMin; cz <= czMax; cz++)
+        foreach (int ly in new[] { geo.FloorY, geo.ShellTopY })
+        {
+            IServerChunk? chunk = sapi.WorldManager.GetChunk(new BlockPos(cx * 32, ly, cz * 32, PocketDimId));
+            if (chunk?.BlockEntities == null) continue;
+            foreach (var kv in chunk.BlockEntities)
+            {
+                string path = kv.Value?.Block?.Code?.Path ?? "";
+                if (!IsRefillablePath(path)) continue;
+                // Firepits aren't player-taken (the fire burns on its own), so there's no use-event to
+                // trigger a rebuild — instead top their firewood right up on entry so they stay lit.
+                if (path.StartsWith("firepit")) TopFirepitFuel(kv.Key);
+                SnapshotRefillable(kv.Key);
+            }
+        }
+    }
+
+    private void SnapshotRefillable(BlockPos pos)
+    {
+        BlockPos key = pos.Copy();
+        if (refillBackups.ContainsKey(key)) return;          // first sight = full/lit, before any take
+        Block block = sapi!.World.BlockAccessor.GetBlock(pos);
+        byte[]? tree = null;
+        if (sapi.World.BlockAccessor.GetBlockEntity(pos) is { } be)
+        {
+            var t = new TreeAttribute();
+            be.ToTreeAttributes(t);
+            tree = t.ToBytes();
+        }
+        refillBackups[key] = (block.BlockId, tree);
+    }
+
+    // Top a firepit's firewood (fuel slot 0) up to a big stack so it burns for a long time.
+    private void TopFirepitFuel(BlockPos pos)
+    {
+        if (sapi!.World.BlockAccessor.GetBlockEntity(pos) is IBlockEntityContainer cont &&
+            cont.Inventory.Count > 0)
+        {
+            ItemSlot fuel = cont.Inventory[0];
+            if (fuel?.Itemstack != null && fuel.Itemstack.StackSize < FirepitFuelRefill)
+            {
+                fuel.Itemstack.StackSize = FirepitFuelRefill;
+                fuel.MarkDirty();
+            }
+        }
+    }
+
+    // A player used a managed block (table/ground storage, vessel, crock, firepit, cheese/pie, …).
+    // Rather than poll, we schedule a one-off rebuild of just that block 20 s later — and the rebuild
+    // only actually restores if something was taken (state differs from the snapshot).
+    private void OnDidUseBlock(IServerPlayer byPlayer, BlockSelection blockSel)
+    {
+        if (!IsPlayerInPocket(byPlayer) || blockSel?.Position == null) return;
+        BlockPos pos = blockSel.Position.Copy();
+        if (!refillBackups.ContainsKey(pos)) return;   // not a snapshotted/managed block
+        ScheduleRebuild(pos);
+    }
+
+    // Debounced 20 s delayed rebuild for one block (multiple takes within the window collapse to one).
+    private void ScheduleRebuild(BlockPos pos)
+    {
+        if (sapi == null || !pendingRebuild.Add(pos)) return;
+        sapi.World.RegisterCallback(_ =>
+        {
+            pendingRebuild.Remove(pos);
+            RebuildBlock(pos);
+        }, RebuildDelayMs);
+    }
+
+    // Restore one snapshotted block, but only if something was actually taken (its state differs from
+    // the snapshot) — so untouched blocks never churn or re-render. Re-places the block too if it was
+    // removed (e.g. a fully-eaten cheese/pie) before restoring its contents.
+    private void RebuildBlock(BlockPos pos)
+    {
+        if (sapi == null || PocketDimId < 0) return;
+        if (!refillBackups.TryGetValue(pos, out (int blockId, byte[]? tree) snap)) return;
+        IBlockAccessor ba = sapi.World.BlockAccessor;
+
+        bool blockChanged = ba.GetBlock(pos).BlockId != snap.blockId;
+        if (snap.tree == null)
+        {
+            if (blockChanged) ba.SetBlock(snap.blockId, pos);
+            return;
+        }
+        if (!blockChanged && ba.GetBlockEntity(pos) is { } probe)
+        {
+            var curT = new TreeAttribute();
+            probe.ToTreeAttributes(curT);
+            if (BytesEqual(curT.ToBytes(), snap.tree)) return;   // nothing taken → leave it be
+        }
+
+        if (blockChanged) ba.SetBlock(snap.blockId, pos);
+        if (ba.GetBlockEntity(pos) is { } be)
+        {
+            be.FromTreeAttributes(TreeAttribute.CreateFromBytes(snap.tree), sapi.World);
+            be.MarkDirty(true);
+        }
+    }
+
+    private static bool BytesEqual(byte[]? a, byte[]? b)
+    {
+        if (a == null || b == null) return ReferenceEquals(a, b);
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+        return true;
+    }
+
+    // Players can't drop items in the pocket: anything that lands on the floor is returned to the
+    // nearest player there, so it snaps straight back into their (pocket) inventory.
+    private void OnDropSweep(float dt)
+    {
+        if (sapi == null || PocketDimId < 0) return;
+
+        List<EntityItem>? items = null;
+        foreach (Entity e in sapi.World.LoadedEntities.Values)
+        {
+            if (e is EntityItem it && it.Alive && IsPocketInternalY(it.Pos.InternalY))
+                (items ??= new()).Add(it);
+        }
+        if (items == null) return;
+
+        foreach (EntityItem it in items)
+        {
+            ItemStack? stack = it.Itemstack;
+            if (stack == null) continue;
+            IServerPlayer? near = NearestPocketPlayer(it.Pos.XYZ);
+            if (near?.InventoryManager.TryGiveItemstack(stack, true) == true)
+                it.Die(EnumDespawnReason.PickedUp);
+        }
+    }
+
+    private IServerPlayer? NearestPocketPlayer(Vec3d pos)
+    {
+        IServerPlayer? best = null;
+        double bestSq = double.MaxValue;
+        foreach (IPlayer p in sapi!.World.AllOnlinePlayers)
+        {
+            if (p is not IServerPlayer sp || sp.Entity == null) continue;
+            if (!IsPocketInternalY(sp.Entity.Pos.InternalY)) continue;
+            double d = sp.Entity.Pos.XYZ.SquareDistanceTo(pos);
+            if (d < bestSq) { bestSq = d; best = sp; }
+        }
+        return best;
+    }
+
+    // The pocket is a safe zone: no player can lose HP while inside it. We add a damage modifier to
+    // each player's health behavior that zeroes ALL incoming damage (mobs, fall, starvation, etc.)
+    // whenever they are in the pocket dimension. The check is dynamic, so damage is only cancelled
+    // while actually inside. The handler is added once per login; the player's entity (and its
+    // health behavior) is rebuilt on each join, so handlers don't accumulate across relogs.
+    private void HookInvulnerability(IServerPlayer player)
+    {
+        EntityBehaviorHealth? hp = player.Entity?.GetBehavior<EntityBehaviorHealth>();
+        if (hp == null) return;
+        hp.onDamaged += (dmg, src) =>
+            PocketDimId >= 0 && player.Entity != null &&
+            DimFromInternalY(player.Entity.Pos.InternalY) == PocketDimId
+                ? 0f
+                : dmg;
+    }
+
+    // Animals (and any non-player creature) in the pocket are unkillable: when one spawns or loads
+    // there, we add the same zero-damage modifier to its health behavior. Only entities that appear
+    // inside the pocket are hooked, so overworld creatures are unaffected.
+    private void HookEntityInvulnerability(Entity entity)
+    {
+        if (entity is EntityPlayer) return;                  // players handled in HookInvulnerability
+        if (!IsPocketInternalY(entity.Pos.InternalY)) return;
+        EntityBehaviorHealth? hp = entity.GetBehavior<EntityBehaviorHealth>();
+        if (hp == null) return;
+        hp.onDamaged += (dmg, src) => IsPocketInternalY(entity.Pos.InternalY) ? 0f : dmg;
+    }
+
+    // Temperature-sensitive blocks (lit torches, firepits) extinguish when it "rains" on them. In a
+    // Manifold dimension the engine's rain-exposure check is dimension-blind: it reads the overworld
+    // heightmap via the position-less GetRainMapHeightAt(x,z) overload, so nothing you build in the
+    // pocket — not even a solid ceiling — can shelter a block, and overworld precipitation snuffs
+    // every lit block (you even hear phantom rain). The rain intensity is GetPrecipitation, which
+    // scales with the position's climate Rainfall — so we force the pocket's rainfall to zero
+    // whenever its climate is queried, collapsing precipitation there to ~0. Only pocket-dimension
+    // positions match (the BlockPos encodes the dimension in its Y / dimension field), so overworld
+    // weather is left completely untouched.
+    private void OnPocketGetClimate(ref ClimateCondition climate, BlockPos pos, EnumGetClimateMode mode, double totalDays)
+    {
+        if (climate == null || PocketDimId < 0) return;
+        if (pos.dimension != PocketDimId && pos.Y / BlockPos.DimensionBoundary != PocketDimId) return;
+        climate.Rainfall = 0f;
+        climate.RainCloudOverlay = 0f;
+    }
+
+    private void LoadConfig(ICoreServerAPI sapi)
+    {
+        try
+        {
+            config = sapi.LoadModConfig<PortalsConfig>(ConfigFile) ?? new PortalsConfig();
+        }
+        catch (Exception e)
+        {
+            Mod.Logger.Warning("[Portals] config load failed ({0}); using defaults.", e.Message);
+            config = new PortalsConfig();
+        }
+        // Write it back so the file exists (and any new fields get their defaults persisted).
+        sapi.StoreModConfig(config, ConfigFile);
     }
 
     private static int DimFromInternalY(double internalY) => (int)(internalY / BlockPos.DimensionBoundary);
 
-    // ── Lighting (forced relight; see comments above) ────────────────────────
-
-    // Replicate a player's place+pickup near someone who just edited a block, but only in the pocket.
-    private void RelightAroundPlayer(IServerPlayer? player)
-    {
-        if (sapi == null || PocketDimId < 0 || player?.Entity == null) return;
-        if (DimFromInternalY(player.Entity.Pos.InternalY) != PocketDimId) return;
-        ForceRelight(PlayerLocalPos(player));
-    }
-
-    // Force the engine's real relight by doing exactly what fixes it by hand: place a solid block in
-    // an empty cell, then remove it a tick later. Two genuine block changes through the DEFAULT
-    // accessor trigger the lighting flood that FullRelight / bulk relight don't. Only blinks empty
-    // cells (non-destructive) and keeps block-entity blocks like lanterns untouched.
-    private void ForceRelight(BlockPos airCell)
-    {
-        if (sapi == null || tempBlockId == 0) return;
-        IBlockAccessor ba = sapi.World.BlockAccessor;
-        if (ba.GetBlock(airCell).BlockId != 0) return;
-
-        ba.SetBlock(tempBlockId, airCell);                              // place (relight #1)
-        sapi.World.RegisterCallback(_ =>
-        {
-            if (sapi.World.BlockAccessor.GetBlock(airCell).BlockId == tempBlockId)
-                sapi.World.BlockAccessor.SetBlock(0, airCell);          // remove (relight #2)
-        }, 150);
-    }
-
-    // Relight the whole interior by doing the manual fix to EVERY light source at once: scan the
-    // room, pull out every light-emitting block, then re-place them a tick later. Block-entity
-    // blocks (lanterns store their metal/glass there) have their data captured and restored so they
-    // come back identical. This is what reliably lights the room on entry / login.
-    private void RelightAllSources()
-    {
-        if (sapi == null || PocketDimId < 0) return;
-        IBlockAccessor ba = sapi.World.BlockAccessor;
-
-        var sources = new List<(BlockPos pos, int id, ITreeAttribute? be)>();
-        for (int x = ShellMin + 1; x < ShellMax; x++)
-        for (int z = ShellMin + 1; z < ShellMax; z++)
-        for (int y = FloorY + 1; y < ShellTopY; y++)
-        {
-            var pos = new BlockPos(x, y, z, PocketDimId);
-            Block b = ba.GetBlock(pos);
-            if (b.BlockId == 0 || b.LightHsv[2] <= 0) continue;
-
-            ITreeAttribute? tree = null;
-            if (b.EntityClass != null && ba.GetBlockEntity(pos) is { } be)
-            {
-                tree = new TreeAttribute();
-                be.ToTreeAttributes(tree);
-            }
-            sources.Add((pos.Copy(), b.BlockId, tree));
-        }
-
-        if (sources.Count == 0) return;
-
-        foreach (var s in sources) ba.SetBlock(0, s.pos);                    // remove all (relight)
-
-        sapi.World.RegisterCallback(_ =>
-        {
-            foreach (var s in sources)
-            {
-                ba.SetBlock(s.id, s.pos);                                    // re-place (relight)
-                if (s.be != null && ba.GetBlockEntity(s.pos) is { } nbe)
-                {
-                    nbe.FromTreeAttributes(s.be, sapi.World);
-                    nbe.MarkDirty(true);
-                }
-            }
-        }, 150);
-    }
-
-    private BlockPos PlayerLocalPos(IServerPlayer player)
-    {
-        EntityPos ep = player.Entity.Pos;
-        int dim = DimFromInternalY(ep.InternalY);
-        int ly = (int)Math.Floor(ep.InternalY) - dim * BlockPos.DimensionBoundary;
-        return new BlockPos((int)Math.Floor(ep.X), ly + 1, (int)Math.Floor(ep.Z), dim);
-    }
-
-    private string LightReport(BlockPos p)
-    {
-        IBlockAccessor ba = sapi!.World.BlockAccessor;
-        int block = ba.GetLightLevel(p, EnumLightLevelType.OnlyBlockLight);
-        int sun = ba.GetLightLevel(p, EnumLightLevelType.OnlySunLight);
-        int max = ba.GetLightLevel(p, EnumLightLevelType.MaxLight);
-        return $"block={block} sun={sun} max={max}";
-    }
+    private static int FloorDiv(int a, int b) => (int)Math.Floor((double)a / b);
 
     // ── Relog handling ───────────────────────────────────────────────────────
     // We track whether a player is in the pocket with the persistent "portals:inPocket" watched
@@ -240,29 +459,62 @@ public class PortalsModSystem : ModSystem
         }, 1500);
     }
 
+    // Restore a player who just woke from sleeping in the pocket. The time-skip can either just drop
+    // the chunks client-side or eject the player from the dimension entirely; re-teleporting handles
+    // both. Keeps them in place if still inside; otherwise puts them back on the spawn.
+    private void RestoreAfterWake(IServerPlayer player)
+    {
+        if (Manifold == null || player.Entity == null) return;
+        if (!player.Entity.WatchedAttributes.GetBool("portals:inPocket")) return;
+
+        EnsurePocketChunksLoaded();
+
+        // Prefer the exact bed they lay down on; else keep them in place (if still inside); else spawn.
+        BlockPos target;
+        if (sleepReturnPos.TryGetValue(player.PlayerUID, out BlockPos? bed))
+        {
+            target = bed;
+        }
+        else if (DimFromInternalY(player.Entity.Pos.InternalY) == PocketDimId)
+        {
+            EntityPos ep = player.Entity.Pos;
+            int ly = (int)Math.Floor(ep.InternalY) - PocketDimId * BlockPos.DimensionBoundary;
+            target = new BlockPos((int)Math.Floor(ep.X), ly, (int)Math.Floor(ep.Z), PocketDimId);
+        }
+        else target = PocketSpawnPos();
+
+        sleepReturnPos.Remove(player.PlayerUID);
+        Manifold.Transitions.TeleportPlayer(player, PocketDimCode, new TransitionOptions { OverridePosition = target });
+        SchedulePocketRepair();
+        ResendPocketChunks();
+    }
+
     // ── Chunk loading + interior setup ───────────────────────────────────────
-    private BlockPos PocketSpawnPos() => new(SpawnX, FloorY + 8, SpawnZ, PocketDimId);
+    private BlockPos PocketSpawnPos() => new(geo.SpawnX, geo.SpawnY, geo.SpawnZ, PocketDimId);
 
     private void EnsurePocketChunksLoaded()
     {
         if (sapi == null || PocketDimId < 0) return;
 
         // LOAD ONLY — never Create. The columns were generated on first entry and are saved
-        // (persistent dimension); loading restores them intact.
-        int minChunk = ShellMin / 32 - 1;   // -1 margin
-        int maxChunk = ShellMax / 32 + 1;   // 40/32 = 1 → up to chunk 2
-        for (int cx = minChunk; cx <= maxChunk; cx++)
-        for (int cz = minChunk; cz <= maxChunk; cz++)
+        // (persistent dimension); loading restores them intact. Cover the dirt-wrapped footprint
+        // (uses floor-division so the -1 wrapper column lands in chunk -1, not 0).
+        int minCX = FloorDiv(geo.DirtMinX, 32), maxCX = FloorDiv(geo.DirtMaxX, 32);
+        int minCZ = FloorDiv(geo.DirtMinZ, 32), maxCZ = FloorDiv(geo.DirtMaxZ, 32);
+        for (int cx = minCX; cx <= maxCX; cx++)
+        for (int cz = minCZ; cz <= maxCZ; cz++)
             sapi.WorldManager.LoadChunkColumnForDimension(cx, cz, PocketDimId);
     }
 
-    // After a transit into the pocket: place the bosco interior (once), stamp the return arch over
-    // it, and force a real relight.
+    // After a transit into the pocket: place the bosco interior (once) and stamp the return arch
+    // over it. Lighting is handled natively now — the interior sits inside the relight band (low
+    // FloorY + WithRelightHeight) and both the bosco and the arch are placed through relighting
+    // bulk accessors — so there is no longer a manual relight pass.
     private void SchedulePocketRepair()
     {
         if (sapi == null) return;
-        sapi.World.RegisterCallback(_ => { EnsureBoscoPlaced(); StampArch(); }, 2000);
-        sapi.World.RegisterCallback(_ => { EnsureBoscoPlaced(); StampArch(); RelightAllSources(); }, 3500);
+        sapi.World.RegisterCallback(_ => { EnsureBoscoPlaced(); StampArch(); DiscoverRefillables(); }, 2000);
+        sapi.World.RegisterCallback(_ => { EnsureBoscoPlaced(); StampArch(); DiscoverRefillables(); }, 3500);
     }
 
     // (Re)build the return arch idempotently via a relighting bulk accessor. Stamped after the bosco
@@ -271,7 +523,7 @@ public class PortalsModSystem : ModSystem
     {
         if (sapi == null || PocketDimId < 0) return;
 
-        Block? stone = sapi.World.GetBlock(new AssetLocation("game", "stonebricks-granite"))
+        Block? stone = sapi.World.GetBlock(new AssetLocation(geo.ArchBlockCode))
                     ?? sapi.World.GetBlock(new AssetLocation("game", "rock-granite"));
         if (stone == null) return;
         int stoneId = stone.BlockId;
@@ -280,17 +532,24 @@ public class PortalsModSystem : ModSystem
         for (int dx = -1; dx <= 1; dx++)
         for (int dy = 0; dy <= 2; dy++)
         {
-            int wx = ArchCenterX + dx;
-            int wy = ArchBaseY + dy;
+            int wx = geo.ArchCenterX + dx;
+            int wy = geo.ArchBaseY + dy;
             bool hole = dx == 0 && dy <= 1;     // centre column, lowest two cells = the doorway
-            ba.SetBlock(hole ? 0 : stoneId, new BlockPos(wx, wy, ArchZ, PocketDimId));
+            ba.SetBlock(hole ? 0 : stoneId, new BlockPos(wx, wy, geo.ArchZ, PocketDimId));
         }
+
+        // A single lit torch standing on top of the arch's centre block.
+        Block? torch = sapi.World.GetBlock(new AssetLocation("game", "torch-basic-lit-up"))
+                    ?? sapi.World.GetBlock(new AssetLocation("game", "torch-crude-lit-up"));
+        if (torch != null)
+            ba.SetBlock(torch.BlockId, new BlockPos(geo.ArchCenterX, geo.ArchBaseY + 3, geo.ArchZ, PocketDimId));
+
         ba.Commit();
     }
 
     // Stamp the bosco schematic into the shell once per dimension (guarded by a savegame flag),
     // aligned to the cube footprint with its base on the floor. Returns the number of blocks placed.
-    private int EnsureBoscoPlaced(bool force = false)
+    internal int EnsureBoscoPlaced(bool force = false)
     {
         if (sapi == null || PocketDimId < 0) return 0;
 
@@ -301,12 +560,12 @@ public class PortalsModSystem : ModSystem
         if (schem == null) return 0;
 
         EnsurePocketChunksLoaded();
-        var origin = new BlockPos(ShellMin, FloorY, ShellMin, PocketDimId);   // (0, 64, 0)
+        var origin = new BlockPos(geo.BoscoOriginX, geo.FloorY, geo.BoscoOriginZ, PocketDimId);
 
         int placed;
         try
         {
-            IBulkBlockAccessor bulk = sapi.World.GetBlockAccessorBulkUpdate(synchronize: true, relight: false);
+            IBulkBlockAccessor bulk = sapi.World.GetBlockAccessorBulkUpdate(synchronize: true, relight: true);
             schem.Init(bulk);
             placed = schem.Place(bulk, sapi.World, origin, EnumReplaceMode.ReplaceAllNoAir, replaceMetaBlocks: true);
             bulk.Commit();
@@ -331,18 +590,54 @@ public class PortalsModSystem : ModSystem
         return placed;
     }
 
+    // If the schematic contains the configured arch-marker block, return its position (relative to
+    // the schematic) and remove it from the schematic so it isn't placed — the return arch is stamped
+    // there instead. Returns null if no marker is present.
+    private (int X, int Y, int Z)? FindAndStripArchMarker(BlockSchematic schem)
+    {
+        string code = config.ArchMarkerBlockCode;
+        if (string.IsNullOrEmpty(code)) return null;
+
+        int markerId = -1;
+        foreach (var kv in schem.BlockCodes)
+        {
+            AssetLocation? c = kv.Value;
+            if (c != null && (c.Path == code || c.ToShortString() == code)) { markerId = kv.Key; break; }
+        }
+        if (markerId < 0) return null;
+
+        for (int i = 0; i < schem.BlockIds.Count; i++)
+        {
+            if (schem.BlockIds[i] != markerId) continue;
+
+            uint idx = schem.Indices[i];
+            int rx = (int)(idx & 0x3FF), rz = (int)((idx >> 10) & 0x3FF), ry = (int)((idx >> 20) & 0x3FF);
+
+            schem.Indices.RemoveAt(i);
+            schem.BlockIds.RemoveAt(i);
+            schem.BlockEntities?.Remove(idx);
+
+            Mod.Logger.Notification("[Portals] Arch marker '{0}' at schematic ({1},{2},{3}); arch placed there.",
+                code, rx, ry, rz);
+            return (rx, ry, rz);
+        }
+        return null;
+    }
+
     // Force-resend the footprint chunk columns to every player currently in the pocket. The bulk
     // accessor's own sync is unreliable in this dimension (same family as the relight issue), so
     // this guarantees the freshly-placed bosco actually shows up client-side.
     private void ResendPocketChunks()
     {
         if (sapi == null || PocketDimId < 0) return;
+        int minCX = FloorDiv(geo.ShellMinX, 32), maxCX = FloorDiv(geo.ShellMaxX, 32);
+        int minCZ = FloorDiv(geo.ShellMinZ, 32), maxCZ = FloorDiv(geo.ShellMaxZ, 32);
         foreach (IPlayer p in sapi.World.AllOnlinePlayers)
         {
             if (p is not IServerPlayer sp || sp.Entity == null) continue;
             if (DimFromInternalY(sp.Entity.Pos.InternalY) != PocketDimId) continue;
-            for (int cx = ShellMin / 32; cx <= ShellMax / 32; cx++)
-            for (int cz = ShellMin / 32; cz <= ShellMax / 32; cz++)
+            for (int cx = minCX; cx <= maxCX; cx++)
+            for (int cz = minCZ; cz <= maxCZ; cz++)
                 sapi.WorldManager.ForceSendChunkColumn(sp, cx, cz, PocketDimId);
         }
     }
@@ -353,7 +648,7 @@ public class PortalsModSystem : ModSystem
 
         // "schematics" is not a scanned asset category, so Assets.TryGet won't find it. Try it
         // anyway (cheap), then fall back to reading the file straight out of the mod folder/zip.
-        string? json = sapi!.Assets.TryGet(BoscoAsset, true)?.ToText() ?? ReadBoscoFromModFile();
+        string? json = sapi!.Assets.TryGet(boscoAsset, true)?.ToText() ?? ReadBoscoFromModFile();
         if (json == null)
         {
             Mod.Logger.Warning("[Portals] bosco schematic could not be loaded (asset + mod file both missing).");
@@ -364,7 +659,48 @@ public class PortalsModSystem : ModSystem
         boscoSchematic = BlockSchematic.LoadFromString(json, ref err);
         if (boscoSchematic == null)
             Mod.Logger.Warning("[Portals] bosco LoadFromString failed: {0}", err);
+        else
+            StripBannedBlocks(boscoSchematic);
         return boscoSchematic;
+    }
+
+    // Delete banned blocks (e.g. the crash-prone cabinet) from a freshly loaded schematic, along with
+    // their block-entities and any decor, so they're never placed in the pocket — regardless of what
+    // ends up in a re-exported bosco.
+    private void StripBannedBlocks(BlockSchematic schem)
+    {
+        if (config.BannedBlockPrefixes == null || config.BannedBlockPrefixes.Length == 0) return;
+
+        var bannedIds = new HashSet<int>();
+        foreach (var kv in schem.BlockCodes)
+            if (MatchesAnyPrefix(kv.Value?.Path ?? "", config.BannedBlockPrefixes)) bannedIds.Add(kv.Key);
+        if (bannedIds.Count == 0) return;
+
+        var removed = new HashSet<uint>();
+        var ni = new List<uint>(schem.Indices.Count);
+        var nb = new List<int>(schem.BlockIds.Count);
+        for (int i = 0; i < schem.Indices.Count; i++)
+        {
+            if (bannedIds.Contains(schem.BlockIds[i])) removed.Add(schem.Indices[i]);
+            else { ni.Add(schem.Indices[i]); nb.Add(schem.BlockIds[i]); }
+        }
+        schem.Indices = ni;
+        schem.BlockIds = nb;
+
+        foreach (uint p in removed) schem.BlockEntities.Remove(p);
+
+        if (schem.DecorIndices != null && schem.DecorIds != null &&
+            schem.DecorIndices.Count == schem.DecorIds.Count)
+        {
+            var di = new List<uint>();
+            var dd = new List<long>();
+            for (int i = 0; i < schem.DecorIndices.Count; i++)
+                if (!removed.Contains(schem.DecorIndices[i])) { di.Add(schem.DecorIndices[i]); dd.Add(schem.DecorIds[i]); }
+            schem.DecorIndices = di;
+            schem.DecorIds = dd;
+        }
+
+        Mod.Logger.Notification("[Portals] Stripped {0} banned block(s) from the bosco schematic.", removed.Count);
     }
 
     // Read the schematic directly from this mod's source (folder or packed zip), bypassing the
@@ -374,7 +710,7 @@ public class PortalsModSystem : ModSystem
         try
         {
             string src = Mod.SourcePath;
-            string rel = "assets/" + Domain + "/schematics/bosco.json";
+            string rel = "assets/" + Domain + "/" + config.BoscoSchematicPath;
 
             if (Directory.Exists(src))   // mod is an unpacked folder
             {
@@ -384,8 +720,19 @@ public class PortalsModSystem : ModSystem
             if (File.Exists(src))        // mod is a packed .zip
             {
                 using ZipArchive zip = ZipFile.OpenRead(src);
+                // Match the entry regardless of path-separator style: some zip tools (e.g. PowerShell's
+                // Compress-Archive) write backslash separators, which a forward-slash GetEntry misses.
                 ZipArchiveEntry? entry = zip.GetEntry(rel);
-                if (entry == null) return null;
+                if (entry == null)
+                    foreach (ZipArchiveEntry e in zip.Entries)
+                        if (e.FullName.Replace('\\', '/').Equals(rel, StringComparison.OrdinalIgnoreCase))
+                        { entry = e; break; }
+
+                if (entry == null)
+                {
+                    Mod.Logger.Warning("[Portals] bosco entry '{0}' not found in mod zip '{1}'.", rel, src);
+                    return null;
+                }
                 using Stream s = entry.Open();
                 using StreamReader r = new(s);
                 return r.ReadToEnd();
@@ -401,14 +748,14 @@ public class PortalsModSystem : ModSystem
     private void RegisterPocketDimension(ICoreServerAPI sapi)
     {
         IDimension dim = Manifold!.Registry
-            .Define(PocketDimCode)
+            .Define(geo.DimCode)
             .Persistent()
-            .WithWorldgen(new PocketShellWorldgen())
-            .WithFixedSpawn(PocketSpawn)
+            .WithWorldgen(new PocketShellWorldgen(geo))
+            .WithFixedSpawn(new BlockPos(geo.SpawnX, geo.SpawnY, geo.SpawnZ, 0))
             .WithSpawnBehavior(SpawnBehavior.DimensionSpawn)
-            // Spawn lands in chunk (0,0); radius 2 covers the whole 2×2-chunk shell with margin.
-            .WithGenerationRadius(2)
-            .WithRelightHeight(40)
+            // Radius derived from the footprint so the whole cube generates, even for large boscos.
+            .WithGenerationRadius(geo.GenerationRadius)
+            .WithRelightHeight(geo.RelightHeight)
             // The pocket keeps its own hotbar + backpack: on entry the player's overworld held items
             // and backpacks are snapshotted to player save and the (initially empty) pocket set loads,
             // so they arrive carrying only worn armour/clothing; on exit everything is restored. The
@@ -440,36 +787,7 @@ public class PortalsModSystem : ModSystem
                 return TextCommandResult.Success("Entering the pocket...");
             });
 
-        // /pocket relight — force a relight of the pocket interior and report light levels.
-        pocket.BeginSubCommand("relight")
-            .WithDescription("Force-relight the pocket interior (debug).")
-            .RequiresPrivilege("chat")
-            .RequiresPlayer()
-            .HandleWith(args =>
-            {
-                if (args.Caller.Player is not IServerPlayer player || player.Entity == null)
-                    return TextCommandResult.Error("No player.");
-                if (DimFromInternalY(player.Entity.Pos.InternalY) != PocketDimId)
-                    return TextCommandResult.Error("You are not in the pocket dimension.");
-
-                BlockPos here = PlayerLocalPos(player);
-                string before = LightReport(here);
-
-                RelightAllSources();
-
-                sapi.World.RegisterCallback(_ =>
-                {
-                    string after = LightReport(here);
-                    sapi.SendMessage(player, 0,
-                        $"[Portals] relight @ {here.X},{here.Y},{here.Z} (dim {PocketDimId})\n  before: {before}\n  after:  {after}",
-                        EnumChatType.Notification);
-                }, 800);
-
-                return TextCommandResult.Success("Relighting...");
-            })
-            .EndSubCommand();
-
-        // /pocket rebuild — force (re)placement of the bosco interior, then relight.
+        // /pocket rebuild — force (re)placement of the bosco interior.
         pocket.BeginSubCommand("rebuild")
             .WithDescription("Force re-stamp the bosco interior (debug).")
             .RequiresPrivilege("chat")
@@ -482,12 +800,11 @@ public class PortalsModSystem : ModSystem
                     return TextCommandResult.Error("You are not in the pocket dimension.");
 
                 int placed = EnsureBoscoPlaced(force: true);
-                sapi.World.RegisterCallback(_ => RelightAllSources(), 500);
                 return TextCommandResult.Success($"Bosco rebuild: {placed} blocks placed.");
             })
             .EndSubCommand();
 
-        // /back — return to the world (the way out now that there's no walk-through arch).
+        // /back — return to the world.
         sapi.ChatCommands.Create("back")
             .WithDescription("Return to the world from the Portals pocket dimension.")
             .RequiresPrivilege("chat")
@@ -524,6 +841,26 @@ public class PortalsModSystem : ModSystem
             if (prevState.TryGetValue(uid, out var prev) && prev.dim == dim)
                 ScanSegment(sp, prev.pos, cur);
             prevState[uid] = (cur, dim);
+
+            // Sleeping in a bed mounts the player; waking unmounts them. The sleep time-skip can drop
+            // the player out of the pocket entirely (waking into empty overworld/void) and fires no
+            // login event to restore it — so on waking while still flagged in-pocket, re-run the full
+            // relog-style restore. We check the in-pocket flag, NOT the current dimension, precisely
+            // because they may have been ejected from it.
+            bool mounted = sp.Entity.MountedOn != null;
+            if (mounted && !mountedUids.Contains(uid) && dim == PocketDimId)
+            {
+                // Just lay down in the pocket — remember the bed spot so we wake them right there.
+                int bly = (int)Math.Floor(ep.InternalY) - PocketDimId * BlockPos.DimensionBoundary;
+                sleepReturnPos[uid] = new BlockPos((int)Math.Floor(ep.X), bly, (int)Math.Floor(ep.Z), PocketDimId);
+            }
+            if (mountedUids.Contains(uid) && !mounted &&
+                sp.Entity.WatchedAttributes.GetBool("portals:inPocket"))
+            {
+                Mod.Logger.Notification("[Portals] uid={0} woke in pocket — restoring.", uid);
+                sapi.World.RegisterCallback(_ => RestoreAfterWake(sp), 300);
+            }
+            if (mounted) mountedUids.Add(uid); else mountedUids.Remove(uid);
         }
     }
 
@@ -555,8 +892,8 @@ public class PortalsModSystem : ModSystem
         }
     }
 
-    private static bool IsArchHole(int x, int y, int z)
-        => x == ArchCenterX && z == ArchZ && (y == ArchBaseY || y == ArchBaseY + 1);
+    private bool IsArchHole(int x, int y, int z)
+        => x == geo.ArchCenterX && z == geo.ArchZ && (y == geo.ArchBaseY || y == geo.ArchBaseY + 1);
 
     private void OnArchCrossed(IServerPlayer player)
     {
@@ -605,7 +942,7 @@ public class PortalsModSystem : ModSystem
             player.PlayerUID, origin.X, origin.Y, origin.Z);
 
         // DimensionSpawn lands the player at the fixed spawn. Manifold force-sends the chunks; the
-        // repair pass places the bosco interior (first time) and relights.
+        // repair pass places the bosco interior (first time) and stamps the return arch.
         Manifold!.Transitions.TeleportPlayer(player, PocketDimCode, new TransitionOptions());
         SchedulePocketRepair();
         sapi!.SendMessage(player, 0, "You step through into the pocket.", EnumChatType.Notification);
