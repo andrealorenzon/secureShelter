@@ -2,11 +2,12 @@
     "$schema": "https://moddbcdn.vintagestory.at/schema/modinfo.latest.json",
     "type": "Code",
     "modid": "portals",
-    "name": "Portals",
+    "name": "Spaturno and Trini Secret Shelter",
     "authors": [
-        "Spaturno"
+        "Spaturno",
+        "Trini"
     ],
-    "description": "Portals",
+    "description": "A personal pocket-dimension shelter, reached through a painting: a safe, static refuge that tends itself.",
     "version": "1.0.0",
     "dependencies": {
         "game": "1.22.0",

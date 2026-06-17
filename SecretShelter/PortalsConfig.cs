@@ -23,9 +23,9 @@ public sealed class PortalsConfig
     public int BoxOriginX = 100;
     public int BoxOriginZ = 100;
 
-    /// <summary>Spawn X / Z inside the cube, relative to the box's min corner.</summary>
+    /// <summary>Spawn X inside the cube, relative to the box's min corner (the arch's X follows it;
+    /// the arrival Z is derived from the return arch, so there's no SpawnZ).</summary>
     public int SpawnX = 19;
-    public int SpawnZ = 31;
 
     /// <summary>Player spawns this many blocks above the floor (so they land on the forest surface).</summary>
     public int SpawnHeightAboveFloor = 8;
@@ -64,7 +64,7 @@ public sealed class PortalsConfig
     public string ArchBlockCode = "game:stonebricks-granite";
 
     /// <summary>Path (under <c>assets/portals/</c>) to the interior schematic stamped into the cube.</summary>
-    public string BoscoSchematicPath = "schematics/bosco.json";
+    public string BoscoSchematicPath = "schematics/shelter.json";
 
     /// <summary>Block-code prefixes deleted from the schematic when it loads (along with their
     /// block-entities and decor), so they're never placed in the pocket. Defaults to the vanilla
