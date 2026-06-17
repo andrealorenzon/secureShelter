@@ -1,0 +1,28 @@
+{
+	"code": "securesheltercomponents",
+	"maxstacksize": 1,
+	"shape": { "base": "game:item/bag/linensack" },
+	"textures": {
+		"linen": { "base": "game:item/bag/linensack/linen" },
+		"top": { "base": "game:item/bag/linensack/top" }
+	},
+	"creativeinventory": { "general": ["*"], "items": ["*"] },
+	"guiTransform": {
+		"translation": { "x": 0, "y": 0, "z": 0 },
+		"rotation": { "x": -25, "y": 23, "z": 180 },
+		"origin": { "x": 0.5299, "y": 0.23, "z": 0.5 },
+		"scale": 2.7,
+		"rotate": true
+	},
+	"tpHandTransform": {
+		"translation": { "x": -0.7, "y": -0.5, "z": -0.6 },
+		"rotation": { "x": -4, "y": 47, "z": -17 },
+		"scale": 0.81
+	},
+	"groundTransform": {
+		"translation": { "x": 0, "y": 0, "z": 0 },
+		"rotation": { "x": 180, "y": 33, "z": -180 },
+		"origin": { "x": 0.5, "y": 0, "z": 0.5 },
+		"scale": 4
+	}
+}

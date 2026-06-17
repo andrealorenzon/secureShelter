@@ -2,14 +2,14 @@ using Manifold.Api.Worldgen;
 using Vintagestory.API.Common;
 using Vintagestory.API.MathTools;
 
-namespace Portals;
+namespace SecureShelter;
 
 /// <summary>
 /// Builds the pocket dimension as a hollow shell of "bedrock" (mantle) wrapped in an opaque dirt
 /// box (mantle absorbs no light, so light would otherwise leak straight through). The shell is
 /// sized to whatever the bosco schematic measures — see <see cref="PocketGeometry"/>. The interior
 /// is left empty here; the bosco forest is stamped in at runtime (see
-/// <see cref="PortalsModSystem.EnsureBoscoPlaced"/>), and the entry portal (the painting) lives in
+/// <see cref="SecureShelterModSystem.EnsureBoscoPlaced"/>), and the entry portal (the painting) lives in
 /// the overworld.
 /// </summary>
 public sealed class PocketShellWorldgen : IWorldgenStrategy

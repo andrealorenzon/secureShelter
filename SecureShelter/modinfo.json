@@ -1,0 +1,16 @@
+{
+    "$schema": "https://moddbcdn.vintagestory.at/schema/modinfo.latest.json",
+    "type": "Code",
+    "modid": "secureshelter",
+    "name": "Spaturno and Trini Secure Shelter",
+    "authors": [
+        "Spaturno",
+        "Trini"
+    ],
+    "description": "A shared shelter, reached through a painting: a safe, a static refuge that tends itself.",
+    "version": "0.0.1",
+    "dependencies": {
+        "game": "1.22.3",
+        "manifold": "0.4.1"
+    }
+}

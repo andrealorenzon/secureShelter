@@ -1,6 +1,6 @@
 {
 	code: "painting",
-	class: "portals.painting",
+	class: "SecureShelter.painting",
 	behaviorsByType: {
 		"*": [ { name: "HorizontalAttachable" } ]
 	},
@@ -13,7 +13,7 @@
 		rotateYByType: { "*-north": 180, "*-east": 90, "*-south": 0, "*-west": 270 }
 	},
 	textures: {
-		"painting": { base: "portals:block/painting/hut" }
+		"painting": { base: "secureshelter:block/painting/hut" }
 	},
 	creativeinventory: {
 		"general": ["painting-storditishut-north"],

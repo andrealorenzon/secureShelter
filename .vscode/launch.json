@@ -21,9 +21,9 @@
                 // "--openWorld" , "modding test world",
                 "--tracelog",
                 "--addModPath",
-                "${workspaceFolder}/Portals/bin/Debug/Mods",
+                "${workspaceFolder}/SecureShelter/bin/Debug/Mods",
                 "--addOrigin",
-                "${workspaceFolder}/Portals/assets"
+                "${workspaceFolder}/SecureShelter/assets"
             ],
             "console": "internalConsole",
             "stopAtEntry": false
@@ -43,9 +43,9 @@
             "args": [
                 "--tracelog",
                 "--addModPath",
-                "${workspaceFolder}/Portals/bin/Debug/Mods",
+                "${workspaceFolder}/SecureShelter/bin/Debug/Mods",
                  "--addOrigin",
-                 "${workspaceFolder}/Portals/assets"
+                 "${workspaceFolder}/SecureShelter/assets"
             ],
             "console": "internalConsole",
             "stopAtEntry": false

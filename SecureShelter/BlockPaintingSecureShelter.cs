@@ -2,17 +2,17 @@ using Vintagestory.API.Common;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
 
-namespace Portals;
+namespace SecureShelter;
 
 /// <summary>
 /// The "Storditi's hut" painting — a 1×1 painting that serves as the entry portal.
 /// Right-clicking it teleports the player into the pocket dimension (the matching return
 /// is the walk-through stone arch inside the pocket). All teleport logic lives in
-/// <see cref="PortalsModSystem"/>; this block only forwards the interaction.
+/// <see cref="SecureShelterModSystem"/>; this block only forwards the interaction.
 ///
-/// Code form: <c>portals:painting-storditishut-&lt;side&gt;</c>.
+/// Code form: <c>secureshelter:painting-storditishut-&lt;side&gt;</c>.
 /// </summary>
-public class BlockPaintingPortal : Block
+public class BlockPaintingSecureShelter : Block
 {
     /// <summary>The direction the painting faces, from its <c>side</c> variant.</summary>
     public BlockFacing Facing => BlockFacing.FromCode(Variant["side"]) ?? BlockFacing.NORTH;
@@ -23,7 +23,7 @@ public class BlockPaintingPortal : Block
         if (world.Side == EnumAppSide.Server && byPlayer is IServerPlayer sp)
         {
             world.Api.ModLoader
-                .GetModSystem<PortalsModSystem>()?
+                .GetModSystem<SecureShelterModSystem>()?
                 .EnterPocketViaPainting(sp, blockSel.Position, Facing);
         }
 

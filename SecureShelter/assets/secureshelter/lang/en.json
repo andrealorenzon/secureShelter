@@ -1,5 +1,6 @@
 {
-	"portals:modname": "Spaturno and Trini Secret Shelter",
+	"secureshelter:modname": "Spaturno and Trini Secure Shelter",
+	"item-securesheltercomponents": "Secure Shelter Material Components",
 	"block-painting-storditishut-north": "Storditi's hut",
 	"block-painting-storditishut-east": "Storditi's hut",
 	"block-painting-storditishut-south": "Storditi's hut",

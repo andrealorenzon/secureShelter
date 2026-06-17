@@ -12,20 +12,20 @@ using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
 using Vintagestory.GameContent;
 
-namespace Portals;
+namespace SecureShelter;
 
-public class PortalsModSystem : ModSystem
+public class SecureShelterModSystem : ModSystem
 {
     // ── Identity ─────────────────────────────────────────────────────────────
-    public const string Domain = "portals";
-    private const string ConfigFile = "PortalsConfig.json";
+    public const string Domain = "secureshelter";
+    private const string ConfigFile = "SecureShelterConfig.json";
 
     public static readonly AssetLocation OverworldCode = new("manifold", "overworld");
 
-    // Loaded from ModConfig/PortalsConfig.json; all concrete coordinates live in `geo`, which is
+    // Loaded from ModConfig/SecureShelterConfig.json; all concrete coordinates live in `geo`, which is
     // computed from this config plus the bosco schematic's measured size (so the shell wraps it
     // exactly). Both are resolved in StartServerSide before the dimension is registered.
-    private PortalsConfig config = null!;
+    private SecureShelterConfig config = null!;
     private PocketGeometry geo = null!;
 
     /// <summary>The pocket dimension code (from config). Bumped via config when the layout changes.</summary>
@@ -80,7 +80,7 @@ public class PortalsModSystem : ModSystem
     public override void Start(ICoreAPI api)
     {
         base.Start(api);
-        api.RegisterBlockClass("portals.painting", typeof(BlockPaintingPortal));
+        api.RegisterBlockClass("SecureShelter.painting", typeof(BlockPaintingSecureShelter));
     }
 
     public override void StartServerSide(ICoreServerAPI sapi)
@@ -92,7 +92,7 @@ public class PortalsModSystem : ModSystem
         Manifold = sapi.GetManifoldServer(this);
         if (!Manifold.IsHealthy)
         {
-            Mod.Logger.Warning("[Portals] Manifold is unhealthy; dimension features disabled.");
+            Mod.Logger.Warning("[SecureShelter] Manifold is unhealthy; dimension features disabled.");
             Manifold = null;
             return;
         }
@@ -106,7 +106,7 @@ public class PortalsModSystem : ModSystem
         (int X, int Y, int Z)? archMarker = schem != null ? FindAndStripArchMarker(schem) : null;
         geo = PocketGeometry.Build(config, schem?.SizeX ?? 0, schem?.SizeY ?? 0, schem?.SizeZ ?? 0, archMarker);
         Mod.Logger.Notification(
-            "[Portals] Cube geometry: footprint x[{0}..{1}] z[{2}..{3}] y[{4}..{5}], spawn ({6},{7},{8}), relight {9}.",
+            "[SecureShelter] Cube geometry: footprint x[{0}..{1}] z[{2}..{3}] y[{4}..{5}], spawn ({6},{7},{8}), relight {9}.",
             geo.ShellMinX, geo.ShellMaxX, geo.ShellMinZ, geo.ShellMaxZ, geo.FloorY, geo.ShellTopY,
             geo.SpawnX, geo.SpawnY, geo.SpawnZ, geo.RelightHeight);
 
@@ -158,7 +158,7 @@ public class PortalsModSystem : ModSystem
         claimant = null!;
         if (!IsPlayerInPocket(byPlayer)) return true;   // not this pocket → no objection
         if (IsBowlEdit(byPlayer, blockSel)) return true; // exception: bowls may be placed/picked up
-        claimant = "Portals";
+        claimant = "SecureShelter";
         return false;
     }
 
@@ -421,12 +421,12 @@ public class PortalsModSystem : ModSystem
     {
         try
         {
-            config = sapi.LoadModConfig<PortalsConfig>(ConfigFile) ?? new PortalsConfig();
+            config = sapi.LoadModConfig<SecureShelterConfig>(ConfigFile) ?? new SecureShelterConfig();
         }
         catch (Exception e)
         {
-            Mod.Logger.Warning("[Portals] config load failed ({0}); using defaults.", e.Message);
-            config = new PortalsConfig();
+            Mod.Logger.Warning("[SecureShelter] config load failed ({0}); using defaults.", e.Message);
+            config = new SecureShelterConfig();
         }
         // Write it back so the file exists (and any new fields get their defaults persisted).
         sapi.StoreModConfig(config, ConfigFile);
@@ -437,25 +437,25 @@ public class PortalsModSystem : ModSystem
     private static int FloorDiv(int a, int b) => (int)Math.Floor((double)a / b);
 
     // ── Relog handling ───────────────────────────────────────────────────────
-    // We track whether a player is in the pocket with the persistent "portals:inPocket" watched
+    // We track whether a player is in the pocket with the persistent "secureshelter:inPocket" watched
     // attribute. A login is not a transit, so Manifold won't load the pocket's chunks on its own
     // and the player would spawn into void. On login we therefore load the footprint, transit them
     // back onto the spawn, and run the repair pass.
     private void OnPlayerNowPlaying(IServerPlayer player)
     {
         if (Manifold == null || player.Entity == null) return;
-        if (!player.Entity.WatchedAttributes.GetBool("portals:inPocket")) return;
+        if (!player.Entity.WatchedAttributes.GetBool("secureshelter:inPocket")) return;
 
         sapi!.World.RegisterCallback(_ =>
         {
             if (player.Entity == null) return;
-            if (!player.Entity.WatchedAttributes.GetBool("portals:inPocket")) return;
+            if (!player.Entity.WatchedAttributes.GetBool("secureshelter:inPocket")) return;
 
             EnsurePocketChunksLoaded();
             Manifold.Transitions.TeleportPlayer(
                 player, PocketDimCode, new TransitionOptions { OverridePosition = PocketSpawnPos() });
             SchedulePocketRepair();
-            Mod.Logger.Notification("[Portals] Restored uid={0} into pocket on login.", player.PlayerUID);
+            Mod.Logger.Notification("[SecureShelter] Restored uid={0} into pocket on login.", player.PlayerUID);
         }, 1500);
     }
 
@@ -465,7 +465,7 @@ public class PortalsModSystem : ModSystem
     private void RestoreAfterWake(IServerPlayer player)
     {
         if (Manifold == null || player.Entity == null) return;
-        if (!player.Entity.WatchedAttributes.GetBool("portals:inPocket")) return;
+        if (!player.Entity.WatchedAttributes.GetBool("secureshelter:inPocket")) return;
 
         EnsurePocketChunksLoaded();
 
@@ -510,11 +510,24 @@ public class PortalsModSystem : ModSystem
     // over it. Lighting is handled natively now — the interior sits inside the relight band (low
     // FloorY + WithRelightHeight) and both the bosco and the arch are placed through relighting
     // bulk accessors — so there is no longer a manual relight pass.
+    //
+    // First-entry darkness fix: EnsureBoscoPlaced resends the footprint immediately after it stamps
+    // the interior, but that resend races the post-placement relight and (because EnsureBoscoPlaced
+    // early-returns once the place-once flag is set) never repeats — so on the very first entry the
+    // client keeps the dark, pre-relight chunks until a relog reloads lit ones. The extra resend
+    // passes below push the settled, lit chunk state to the client a beat later, with no relog
+    // needed. ResendPocketChunks / StampArch are both idempotent.
     private void SchedulePocketRepair()
     {
         if (sapi == null) return;
         sapi.World.RegisterCallback(_ => { EnsureBoscoPlaced(); StampArch(); DiscoverRefillables(); }, 2000);
         sapi.World.RegisterCallback(_ => { EnsureBoscoPlaced(); StampArch(); DiscoverRefillables(); }, 3500);
+        // Relight + resend after the block entities have settled, independent of the place-once
+        // guard. The place-time relight runs on bulk.Commit() — BEFORE PlaceEntitiesAndBlockEntities
+        // — so block-entity-driven light sources (oil lamps) are missing from it and arrive dark on
+        // first entry. A full cuboid relight with the BEs present fixes them without needing a relog.
+        sapi.World.RegisterCallback(_ => { StampArch(); RelightPocket(); }, 5000);
+        sapi.World.RegisterCallback(_ => RelightPocket(), 8000);
     }
 
     // (Re)build the return arch idempotently via a relighting bulk accessor. Stamped after the bosco
@@ -553,7 +566,7 @@ public class PortalsModSystem : ModSystem
     {
         if (sapi == null || PocketDimId < 0) return 0;
 
-        string key = "portals:boscoPlaced-" + PocketDimCode.Path;
+        string key = "secureshelter:boscoPlaced-" + PocketDimCode.Path;
         if (!force && sapi.World.Config.GetBool(key)) return 0;
 
         BlockSchematic? schem = GetBoscoSchematic();
@@ -574,18 +587,19 @@ public class PortalsModSystem : ModSystem
         }
         catch (Exception e)
         {
-            Mod.Logger.Error("[Portals] bosco placement threw: {0}", e);
+            Mod.Logger.Error("[SecureShelter] bosco placement threw: {0}", e);
             return 0;
         }
 
         Mod.Logger.Notification(
-            "[Portals] Bosco placement: {0} blocks at ({1},{2},{3}) dim {4}.",
+            "[SecureShelter] Bosco placement: {0} blocks at ({1},{2},{3}) dim {4}.",
             placed, origin.X, origin.Y, origin.Z, PocketDimId);
 
         // 0 placed → the footprint chunks weren't loaded yet; leave the flag unset so a later pass
-        // retries. Otherwise mark done and force a dimension-aware resend so the client sees it.
+        // retries. Otherwise mark done and relight (the block entities are now placed, so any
+        // BE-driven light source — oil lamps — is finally accounted for) + resend to the client.
         if (placed <= 0) return 0;
-        ResendPocketChunks();
+        RelightPocket();
         sapi.World.Config.SetBool(key, true);
         return placed;
     }
@@ -617,7 +631,7 @@ public class PortalsModSystem : ModSystem
             schem.BlockIds.RemoveAt(i);
             schem.BlockEntities?.Remove(idx);
 
-            Mod.Logger.Notification("[Portals] Arch marker '{0}' at schematic ({1},{2},{3}); arch placed there.",
+            Mod.Logger.Notification("[SecureShelter] Arch marker '{0}' at schematic ({1},{2},{3}); arch placed there.",
                 code, rx, ry, rz);
             return (rx, ry, rz);
         }
@@ -642,6 +656,18 @@ public class PortalsModSystem : ModSystem
         }
     }
 
+    // Fully relight the sealed box (after the bosco's block entities are placed) and resend the
+    // affected columns. Unlike the bulk-accessor relight on Commit — which runs before the block
+    // entities exist and so misses BE-driven light (oil lamps) — FullRelight recomputes the whole
+    // cuboid with everything present. Covers the dirt-wrapped footprint so no source is clipped.
+    private void RelightPocket()
+    {
+        if (sapi == null || PocketDimId < 0) return;
+        var min = new BlockPos(geo.DirtMinX, geo.DirtBottomY, geo.DirtMinZ, PocketDimId);
+        var max = new BlockPos(geo.DirtMaxX, geo.DirtTopY, geo.DirtMaxZ, PocketDimId);
+        sapi.WorldManager.FullRelight(min, max, sendToClients: true);
+    }
+
     private BlockSchematic? GetBoscoSchematic()
     {
         if (boscoSchematic != null) return boscoSchematic;
@@ -651,14 +677,14 @@ public class PortalsModSystem : ModSystem
         string? json = sapi!.Assets.TryGet(boscoAsset, true)?.ToText() ?? ReadBoscoFromModFile();
         if (json == null)
         {
-            Mod.Logger.Warning("[Portals] bosco schematic could not be loaded (asset + mod file both missing).");
+            Mod.Logger.Warning("[SecureShelter] bosco schematic could not be loaded (asset + mod file both missing).");
             return null;
         }
 
         string err = "";
         boscoSchematic = BlockSchematic.LoadFromString(json, ref err);
         if (boscoSchematic == null)
-            Mod.Logger.Warning("[Portals] bosco LoadFromString failed: {0}", err);
+            Mod.Logger.Warning("[SecureShelter] bosco LoadFromString failed: {0}", err);
         else
             StripBannedBlocks(boscoSchematic);
         return boscoSchematic;
@@ -700,7 +726,7 @@ public class PortalsModSystem : ModSystem
             schem.DecorIds = dd;
         }
 
-        Mod.Logger.Notification("[Portals] Stripped {0} banned block(s) from the bosco schematic.", removed.Count);
+        Mod.Logger.Notification("[SecureShelter] Stripped {0} banned block(s) from the bosco schematic.", removed.Count);
     }
 
     // Read the schematic directly from this mod's source (folder or packed zip), bypassing the
@@ -730,7 +756,7 @@ public class PortalsModSystem : ModSystem
 
                 if (entry == null)
                 {
-                    Mod.Logger.Warning("[Portals] bosco entry '{0}' not found in mod zip '{1}'.", rel, src);
+                    Mod.Logger.Warning("[SecureShelter] bosco entry '{0}' not found in mod zip '{1}'.", rel, src);
                     return null;
                 }
                 using Stream s = entry.Open();
@@ -740,47 +766,59 @@ public class PortalsModSystem : ModSystem
         }
         catch (Exception e)
         {
-            Mod.Logger.Warning("[Portals] reading bosco from mod file failed: {0}", e.Message);
+            Mod.Logger.Warning("[SecureShelter] reading bosco from mod file failed: {0}", e.Message);
         }
         return null;
     }
 
     private void RegisterPocketDimension(ICoreServerAPI sapi)
     {
-        IDimension dim = Manifold!.Registry
-            .Define(geo.DimCode)
-            .Persistent()
-            .WithWorldgen(new PocketShellWorldgen(geo))
-            .WithFixedSpawn(new BlockPos(geo.SpawnX, geo.SpawnY, geo.SpawnZ, 0))
-            .WithSpawnBehavior(SpawnBehavior.DimensionSpawn)
-            // Radius derived from the footprint so the whole cube generates, even for large boscos.
-            .WithGenerationRadius(geo.GenerationRadius)
-            .WithRelightHeight(geo.RelightHeight)
-            // The pocket keeps its own hotbar + backpack: on entry the player's overworld held items
-            // and backpacks are snapshotted to player save and the (initially empty) pocket set loads,
-            // so they arrive carrying only worn armour/clothing; on exit everything is restored. The
-            // snapshots live in player moddata ("manifold:inv"), so this survives disconnects mid-pocket.
-            // Character (worn equipment) is deliberately left shared — armour/clothes stay on the player.
-            .WithSeparateInventory(ManifoldInventory.Hotbar | ManifoldInventory.Backpack)
-            .RegisterStatic();
+        IDimension dim;
+        try
+        {
+            dim = Manifold!.Registry
+                .Define(geo.DimCode)
+                .Persistent()
+                .WithWorldgen(new PocketShellWorldgen(geo))
+                .WithFixedSpawn(new BlockPos(geo.SpawnX, geo.SpawnY, geo.SpawnZ, 0))
+                .WithSpawnBehavior(SpawnBehavior.DimensionSpawn)
+                // Radius derived from the footprint so the whole cube generates, even for large boscos.
+                .WithGenerationRadius(geo.GenerationRadius)
+                .WithRelightHeight(geo.RelightHeight)
+                // The pocket keeps its own hotbar + backpack: on entry the player's overworld held items
+                // and backpacks are snapshotted to player save and the (initially empty) pocket set loads,
+                // so they arrive carrying only worn armour/clothing; on exit everything is restored. The
+                // snapshots live in player moddata ("manifold:inv"), so this survives disconnects mid-pocket.
+                // Character (worn equipment) is deliberately left shared — armour/clothes stay on the player.
+                .WithSeparateInventory(ManifoldInventory.Hotbar | ManifoldInventory.Backpack)
+                .RegisterStatic();
+        }
+        catch (Manifold.Api.DimensionAlreadyRegisteredException)
+        {
+            // Dimension already registered (e.g., from a previous boot or migration). Fetch the existing one.
+            var existing = Manifold!.Registry.Get(geo.DimCode);
+            if (existing == null)
+                throw new InvalidOperationException($"Dimension {geo.DimCode} is registered but cannot be retrieved.");
+            dim = existing;
+        }
 
         PocketDimId = dim.InternalId;
         Mod.Logger.Notification(
-            "[Portals] Pocket dimension '{0}' ready (engine id {1}).", dim.Code, PocketDimId);
+            "[SecureShelter] Pocket dimension '{0}' ready (engine id {1}).", dim.Code, PocketDimId);
     }
 
     private void RegisterDebugCommand(ICoreServerAPI sapi)
     {
         // /pocket — enter, recording the player's current spot as the return origin.
         var pocket = sapi.ChatCommands.Create("pocket")
-            .WithDescription("Teleport into the Portals pocket dimension.")
+            .WithDescription("Teleport into the Secure Shelter pocket dimension.")
             .RequiresPrivilege("chat")
             .RequiresPlayer()
             .HandleWith(args =>
             {
                 if (args.Caller.Player is not IServerPlayer player || player.Entity == null)
                     return TextCommandResult.Error("No player.");
-                if (player.Entity.WatchedAttributes.GetBool("portals:inPocket"))
+                if (player.Entity.WatchedAttributes.GetBool("secureshelter:inPocket"))
                     return TextCommandResult.Error("You are already in the pocket.");
 
                 EnterPocket(player, player.Entity.Pos.AsBlockPos.Copy());
@@ -806,14 +844,14 @@ public class PortalsModSystem : ModSystem
 
         // /back — return to the world.
         sapi.ChatCommands.Create("back")
-            .WithDescription("Return to the world from the Portals pocket dimension.")
+            .WithDescription("Return to the world from the SecureShelter pocket dimension.")
             .RequiresPrivilege("chat")
             .RequiresPlayer()
             .HandleWith(args =>
             {
                 if (args.Caller.Player is not IServerPlayer player || player.Entity == null)
                     return TextCommandResult.Error("No player.");
-                if (!player.Entity.WatchedAttributes.GetBool("portals:inPocket"))
+                if (!player.Entity.WatchedAttributes.GetBool("secureshelter:inPocket"))
                     return TextCommandResult.Error("You are not in the pocket dimension.");
 
                 ReturnFromPocket(player);
@@ -855,9 +893,9 @@ public class PortalsModSystem : ModSystem
                 sleepReturnPos[uid] = new BlockPos((int)Math.Floor(ep.X), bly, (int)Math.Floor(ep.Z), PocketDimId);
             }
             if (mountedUids.Contains(uid) && !mounted &&
-                sp.Entity.WatchedAttributes.GetBool("portals:inPocket"))
+                sp.Entity.WatchedAttributes.GetBool("secureshelter:inPocket"))
             {
-                Mod.Logger.Notification("[Portals] uid={0} woke in pocket — restoring.", uid);
+                Mod.Logger.Notification("[SecureShelter] uid={0} woke in pocket — restoring.", uid);
                 sapi.World.RegisterCallback(_ => RestoreAfterWake(sp), 300);
             }
             if (mounted) mountedUids.Add(uid); else mountedUids.Remove(uid);
@@ -898,7 +936,7 @@ public class PortalsModSystem : ModSystem
     private void OnArchCrossed(IServerPlayer player)
     {
         if (Manifold == null || sapi == null || player.Entity == null) return;
-        if (!player.Entity.WatchedAttributes.GetBool("portals:inPocket")) return;
+        if (!player.Entity.WatchedAttributes.GetBool("secureshelter:inPocket")) return;
 
         string uid = player.PlayerUID;
         long now = sapi.World.ElapsedMilliseconds;
@@ -924,7 +962,7 @@ public class PortalsModSystem : ModSystem
     public void EnterPocketViaPainting(IServerPlayer player, BlockPos paintingPos, BlockFacing facing)
     {
         if (Manifold == null || player.Entity == null) return;
-        if (player.Entity.WatchedAttributes.GetBool("portals:inPocket")) return;
+        if (player.Entity.WatchedAttributes.GetBool("secureshelter:inPocket")) return;
 
         // Record where the player is standing so the return drops them back exactly where they left.
         EnterPocket(player, player.Entity.Pos.AsBlockPos.Copy());
@@ -933,12 +971,12 @@ public class PortalsModSystem : ModSystem
     private void EnterPocket(IServerPlayer player, BlockPos origin)
     {
         var wa = player.Entity.WatchedAttributes;
-        wa.SetInt("portals:returnX", origin.X);
-        wa.SetInt("portals:returnY", origin.Y);
-        wa.SetInt("portals:returnZ", origin.Z);
-        wa.SetBool("portals:inPocket", true);
+        wa.SetInt("secureshelter:returnX", origin.X);
+        wa.SetInt("secureshelter:returnY", origin.Y);
+        wa.SetInt("secureshelter:returnZ", origin.Z);
+        wa.SetBool("secureshelter:inPocket", true);
 
-        Mod.Logger.Notification("[Portals] EnterPocket uid={0} origin=({1},{2},{3})",
+        Mod.Logger.Notification("[SecureShelter] EnterPocket uid={0} origin=({1},{2},{3})",
             player.PlayerUID, origin.X, origin.Y, origin.Z);
 
         // DimensionSpawn lands the player at the fixed spawn. Manifold force-sends the chunks; the
@@ -951,14 +989,14 @@ public class PortalsModSystem : ModSystem
     private void ReturnFromPocket(IServerPlayer player)
     {
         var wa = player.Entity.WatchedAttributes;
-        wa.SetBool("portals:inPocket", false);
+        wa.SetBool("secureshelter:inPocket", false);
 
-        int rx = wa.GetInt("portals:returnX");
-        int ry = wa.GetInt("portals:returnY");
-        int rz = wa.GetInt("portals:returnZ");
+        int rx = wa.GetInt("secureshelter:returnX");
+        int ry = wa.GetInt("secureshelter:returnY");
+        int rz = wa.GetInt("secureshelter:returnZ");
         bool hasOrigin = !(rx == 0 && ry == 0 && rz == 0);
 
-        Mod.Logger.Notification("[Portals] ReturnFromPocket uid={0} origin=({1},{2},{3}) hasOrigin={4}",
+        Mod.Logger.Notification("[SecureShelter] ReturnFromPocket uid={0} origin=({1},{2},{3}) hasOrigin={4}",
             player.PlayerUID, rx, ry, rz, hasOrigin);
 
         // Step 1: ensure the player is in the overworld dimension (loads chunks). Also recovers the

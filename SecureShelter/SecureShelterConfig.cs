@@ -1,7 +1,7 @@
-namespace Portals;
+namespace SecureShelter;
 
 /// <summary>
-/// User-editable settings for the pocket dimension, loaded from <c>ModConfig/PortalsConfig.json</c>
+/// User-editable settings for the pocket dimension, loaded from <c>ModConfig/SecureShelterConfig.json</c>
 /// (written with defaults on first run). All coordinates are dimension-local.
 ///
 /// The cube's X/Z footprint and height are intentionally NOT set here — they are derived from the
@@ -9,7 +9,7 @@ namespace Portals;
 /// with <see cref="CeilingHeadroom"/> empty layers above it and a <see cref="WrapperThickness"/>-thick
 /// dirt box sealing it from the outside.
 /// </summary>
-public sealed class PortalsConfig
+public sealed class SecureShelterConfig
 {
     /// <summary>Dimension code. Bump it whenever the baked-in layout changes — Manifold caches
     /// generated columns and won't regenerate an existing dimension in place.</summary>
@@ -63,7 +63,7 @@ public sealed class PortalsConfig
     /// <summary>Block the return arch is built from.</summary>
     public string ArchBlockCode = "game:stonebricks-granite";
 
-    /// <summary>Path (under <c>assets/portals/</c>) to the interior schematic stamped into the cube.</summary>
+    /// <summary>Path (under <c>assets/SecureShelter/</c>) to the interior schematic stamped into the cube.</summary>
     public string BoscoSchematicPath = "schematics/shelter.json";
 
     /// <summary>Block-code prefixes deleted from the schematic when it loads (along with their

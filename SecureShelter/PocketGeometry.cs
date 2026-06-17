@@ -1,11 +1,11 @@
 using System;
 using Vintagestory.API.Common;
 
-namespace Portals;
+namespace SecureShelter;
 
 /// <summary>
 /// The concrete dimension-local geometry of the pocket, computed once at startup from the
-/// <see cref="PortalsConfig"/> and the interior schematic's measured size. Everything the worldgen
+/// <see cref="SecureShelterConfig"/> and the interior schematic's measured size. Everything the worldgen
 /// and the runtime need is precomputed here, so the shell is always sized to "whatever dimensions"
 /// the bosco schematic has — there are no scattered magic numbers.
 /// </summary>
@@ -36,10 +36,10 @@ public sealed class PocketGeometry
 
     /// <summary>
     /// Builds the geometry from the config and the schematic's measured size. The box footprint is the
-    /// larger of the bosco size and <see cref="PortalsConfig.MinBoxSize"/> on each axis, and the bosco
+    /// larger of the bosco size and <see cref="SecureShelterConfig.MinBoxSize"/> on each axis, and the bosco
     /// is centred within it. A non-positive size (unreadable schematic) falls back to 40×30×40.
     /// </summary>
-    public static PocketGeometry Build(PortalsConfig cfg, int boscoSizeX, int boscoSizeY, int boscoSizeZ,
+    public static PocketGeometry Build(SecureShelterConfig cfg, int boscoSizeX, int boscoSizeY, int boscoSizeZ,
         (int X, int Y, int Z)? archMarker = null)
     {
         if (boscoSizeX <= 0) boscoSizeX = 40;
@@ -58,7 +58,7 @@ public sealed class PocketGeometry
 
         var g = new PocketGeometry
         {
-            DimCode = new AssetLocation(PortalsModSystem.Domain, cfg.PocketDimensionCode),
+            DimCode = new AssetLocation(SecureShelterModSystem.Domain, cfg.PocketDimensionCode),
             FloorY = cfg.FloorY,
 
             ShellMinX = ox,

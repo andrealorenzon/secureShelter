@@ -9,7 +9,7 @@
                 "build",
                 "-c",
                 "Debug",
-                "${workspaceFolder}/Portals/Portals.csproj"
+                "${workspaceFolder}/SecureShelter/SecureShelter.csproj"
             ],
             "problemMatcher": "$msCompile"
         },

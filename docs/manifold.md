@@ -1,6 +1,6 @@
 # Manifold — Reference Notes
 
-Working notes on the **Manifold** library mod, compiled for building the Portals mod on top of it.
+Working notes on the **Manifold** library mod, compiled for building the Secure Shelter mod on top of it.
 Source: <https://leonfvt.fr/Manifold/> (articles + DocFX API reference).
 
 ---
@@ -264,7 +264,7 @@ Separate inventories store items per owner key (the dimension code or `"shared"`
 
 ### Triggers
 
-**Portal block** (the natural fit for the Portals mod) — subclass `PortalBlockBase`, triggers transit on collision:
+**Portal block** (subclass `PortalBlockBase`, triggers transit on collision) — note Secure Shelter does **not** use this; entry is a right-click on the painting block, not a collision trigger:
 ```csharp
 // override TargetDimensionCode (and optionally Options)
 ```
@@ -323,7 +323,7 @@ new DimensionCommandBuilder()
 ## 9. Caveats & open questions
 
 - **Harmony inconsistency:** the Architecture page states Manifold uses **no Harmony patches**, yet `ManifoldUnhealthyException` is documented as "raised during mutations when Harmony patches failed" and the `IsHealthy` flag exists. Likely stale wording from an earlier design — treat `IsHealthy` as a generic "did Manifold initialize correctly" guard and check it before using the facade.
-- **Version target:** Manifold requires game **1.21+**. The Portals scaffold's `modinfo.json` currently pins `game: 1.22.0` (inherited from Palantir). 1.22 satisfies "1.21+", but lower it if 1.21 support is wanted. Still need to add `"manifold": ""` to dependencies + `dotnet add package Pixnop.Manifold`.
+- **Version target:** Manifold requires game **1.21+**. Secure Shelter's `modinfo.json` pins `game: 1.22.3` and `manifold: 0.4.1`. 1.22 satisfies "1.21+"; lower it if 1.21 support is wanted.
 - DocFX per-type pages were not fully scraped — exact member signatures for some interfaces (`IDimensionRegistry`, `IDimensionBuilder`, etc.) come from the article examples, not the API reference. Confirm signatures against the package/IntelliSense when coding.
 
 ---
@@ -446,13 +446,15 @@ teleports first then retries portal placement (`PlaceExitPortalAfterGeneration`)
 - They cancel maps and temporal-stability drain inside the pocket (client packet + stability override).
 - Two `ModSystem`s: gameplay (`PersonalPocketDimensionModSystem`) and visuals (`PortalEffectSystem`).
 
-### What this means for Portals
-1. Replace the relog **re-transit-into-pocket** hack with a **manual chunk load** of the pocket footprint
-   in `OnPlayerNowPlaying` (11.2) so the player genuinely stays in the pocket with working doors.
-2. Add a **post-transit repair** (re-`SetBlock` the return door + `MarkBlockModified`/`Commit` at +500 ms)
-   to kill the inert-door desync (11.4).
-3. Re-evaluate whether we can **trust `Pos.Dimension`** once chunks are loaded (11.5), simplifying the
-   `portals:inPocket` watched-attribute bookkeeping.
+### What this means for Secure Shelter
+These PPD patterns shaped the current design (see [secureshelter-design.md](secureshelter-design.md)):
+1. **Manual chunk load on relog** (11.2) — `OnPlayerNowPlaying` calls `EnsurePocketChunksLoaded`
+   (load-only) before transiting the player back, so they stay in the pocket instead of dropping into void.
+2. **Post-transit repair** (11.4) — `SchedulePocketRepair` re-stamps the arch + relights the interior at
+   staggered delays so fixtures aren't left desynced (and BE-driven lights like oil lamps relight; see the
+   design doc's Lighting section).
+3. **`secureshelter:inPocket` flag** is still the source of truth for relog/sleep restore rather than
+   trusting `Pos.Dimension` (11.5), since it survives even when the engine ejects the player on a time-skip.
 
 ---
 
