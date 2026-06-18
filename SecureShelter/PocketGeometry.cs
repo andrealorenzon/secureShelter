@@ -32,7 +32,6 @@ public sealed class PocketGeometry
     public string ShellBlockCode = "game:mantle";
     public string ShellBlockFallback = "game:rock-granite";
     public string WrapperBlockCode = "game:soil-medium-none";
-    public string ArchBlockCode = "game:stonebricks-granite";
 
     /// <summary>
     /// Builds the geometry from the config and the schematic's measured size. The box footprint is the
@@ -74,7 +73,6 @@ public sealed class PocketGeometry
             ShellBlockCode = SecureShelterConfig.ShellBlockCode,
             ShellBlockFallback = SecureShelterConfig.ShellBlockFallback,
             WrapperBlockCode = SecureShelterConfig.WrapperBlockCode,
-            ArchBlockCode = SecureShelterConfig.ArchBlockCode,
         };
 
         g.DirtMinX = g.ShellMinX - t;

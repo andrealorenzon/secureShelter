@@ -92,8 +92,9 @@ straight from the mod's source folder/zip (`ReadBoscoFromModFile`).
 - **Banned blocks** (`BannedBlockPrefixes`, default `cabinet`) are stripped from the schematic
   on load — the vanilla cabinet's display slots NRE-crash the client renderer.
 - **Arch marker**: if the schematic contains `ArchMarkerBlockCode` (default `creativeglow-79`),
-  its position becomes the return arch centre and the marker is removed; otherwise the arch
-  falls back to "near the far +Z wall" from config.
+  it's stripped to air and its position becomes the return-portal walk-through trigger — the arch
+  visual itself is built into the schematic, so the mod draws nothing. With no marker, the trigger
+  falls back to "near the far +Z wall" from the config coordinates (no visual arch in that case).
 
 ---
 
@@ -104,8 +105,8 @@ the mod system, which first checks the player is holding the component bag (`Has
 the active hand slot only, never consumed) — no key, no entry. Otherwise it records the player's
 current `x/y/z`, sets the persistent watched attribute `secureshelter:inPocket = true`, then
 `TeleportPlayer(..., PocketDimCode, new TransitionOptions())`. `DimensionSpawn` lands them on the
-fixed spawn. A repair pass then places the bosco (first time), stamps the arch, and discovers
-refillables. (`/pocket` enters without the key — it's a debug command.)
+fixed spawn. A repair pass then places the bosco (first time) and discovers refillables.
+(`/pocket` enters without the key — it's a debug command.)
 
 **Return** (arch crossing → `ReturnFromPocket`). A per-tick listener (`OnServerTick`) samples
 each player's movement *segment* (`ScanSegment`, step 0.25, mid-cell `+0.5`) so a fast walk
@@ -185,4 +186,6 @@ are placed through **relighting** bulk accessors, so the interior is lit. Two su
 - **Geometry / relight changes need a regen** (bump `PocketDimensionCode` or use a new world).
 - **Modid rename is not save-compatible** — old `portals:` saves keep orphaned ids; use a
   fresh world.
-- **Arch model** is a plain 3×2 stone frame with a lit torch on top; tune visually.
+- **The return arch is part of the schematic** — the mod no longer draws an arch or torch. Build the
+  arch (with its opening) into `shelter.json` and place a `creativeglow-79` block in the opening to
+  mark the walk-through trigger cell; the mod strips that block to air at placement.

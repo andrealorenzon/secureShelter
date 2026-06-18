@@ -62,9 +62,6 @@ public sealed class SecureShelterConfig
     /// <summary>Outer wrapper block — opaque, seals light. Dirt by default.</summary>
     public const string WrapperBlockCode = "game:soil-medium-none";
 
-    /// <summary>Block the return arch is built from.</summary>
-    public const string ArchBlockCode = "game:stonebricks-granite";
-
     /// <summary>Path (under <c>assets/secureshelter/</c>) to the interior schematic stamped into the cube.</summary>
     public const string BoscoSchematicPath = "schematics/shelter.json";
 

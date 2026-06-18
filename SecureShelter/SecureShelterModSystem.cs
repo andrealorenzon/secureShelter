@@ -506,45 +506,17 @@ public class SecureShelterModSystem : ModSystem
             sapi.WorldManager.LoadChunkColumnForDimension(cx, cz, PocketDimId);
     }
 
-    // After a transit into the pocket: place the bosco interior (once), stamp the return arch over it,
-    // and snapshot refillables. Lighting is handled natively — the interior sits inside the relight band
-    // (low FloorY + WithRelightHeight) and the bosco and arch are placed through relighting bulk
-    // accessors. Two staggered passes because the footprint chunks may not all be loaded on the first.
+    // After a transit into the pocket: place the bosco interior (once) and snapshot refillables.
+    // Lighting is handled natively — the interior sits inside the relight band (low FloorY +
+    // WithRelightHeight) and the bosco is placed through a relighting bulk accessor. Two staggered
+    // passes because the footprint chunks may not all be loaded on the first. The return portal needs
+    // no stamping: the arch is baked into the schematic, and the arch-marker block's position (see
+    // FindAndStripArchMarker) is the walk-through trigger — the marker is stripped to air (the opening).
     private void SchedulePocketRepair()
     {
         if (sapi == null) return;
-        sapi.World.RegisterCallback(_ => { EnsureBoscoPlaced(); StampArch(); DiscoverRefillables(); }, 2000);
-        sapi.World.RegisterCallback(_ => { EnsureBoscoPlaced(); StampArch(); DiscoverRefillables(); }, 3500);
-    }
-
-    // (Re)build the return arch idempotently via a relighting bulk accessor. Stamped after the bosco
-    // so it sits on top of the forest; self-heals if a player breaks it, and keeps the hole open.
-    private void StampArch()
-    {
-        if (sapi == null || PocketDimId < 0) return;
-
-        Block? stone = sapi.World.GetBlock(new AssetLocation(geo.ArchBlockCode))
-                    ?? sapi.World.GetBlock(new AssetLocation("game", "rock-granite"));
-        if (stone == null) return;
-        int stoneId = stone.BlockId;
-
-        IBulkBlockAccessor ba = sapi.World.GetBlockAccessorBulkUpdate(synchronize: true, relight: true);
-        for (int dx = -1; dx <= 1; dx++)
-        for (int dy = 0; dy <= 2; dy++)
-        {
-            int wx = geo.ArchCenterX + dx;
-            int wy = geo.ArchBaseY + dy;
-            bool hole = dx == 0 && dy <= 1;     // centre column, lowest two cells = the doorway
-            ba.SetBlock(hole ? 0 : stoneId, new BlockPos(wx, wy, geo.ArchZ, PocketDimId));
-        }
-
-        // A single lit torch standing on top of the arch's centre block.
-        Block? torch = sapi.World.GetBlock(new AssetLocation("game", "torch-basic-lit-up"))
-                    ?? sapi.World.GetBlock(new AssetLocation("game", "torch-crude-lit-up"));
-        if (torch != null)
-            ba.SetBlock(torch.BlockId, new BlockPos(geo.ArchCenterX, geo.ArchBaseY + 3, geo.ArchZ, PocketDimId));
-
-        ba.Commit();
+        sapi.World.RegisterCallback(_ => { EnsureBoscoPlaced(); DiscoverRefillables(); }, 2000);
+        sapi.World.RegisterCallback(_ => { EnsureBoscoPlaced(); DiscoverRefillables(); }, 3500);
     }
 
     // Stamp the bosco schematic into the shell once per dimension (guarded by a savegame flag),
@@ -591,8 +563,8 @@ public class SecureShelterModSystem : ModSystem
     }
 
     // If the schematic contains the configured arch-marker block, return its position (relative to
-    // the schematic) and remove it from the schematic so it isn't placed — the return arch is stamped
-    // there instead. Returns null if no marker is present.
+    // the schematic) and strip it to air — that opening becomes the return-portal trigger (the arch
+    // visual is already baked into the schematic). Returns null if no marker is present.
     private (int X, int Y, int Z)? FindAndStripArchMarker(BlockSchematic schem)
     {
         string code = SecureShelterConfig.ArchMarkerBlockCode;
@@ -617,7 +589,7 @@ public class SecureShelterModSystem : ModSystem
             schem.BlockIds.RemoveAt(i);
             schem.BlockEntities?.Remove(idx);
 
-            Mod.Logger.Notification("[SecureShelter] Arch marker '{0}' at schematic ({1},{2},{3}); arch placed there.",
+            Mod.Logger.Notification("[SecureShelter] Arch marker '{0}' at schematic ({1},{2},{3}); portal trigger set there.",
                 code, rx, ry, rz);
             return (rx, ry, rz);
         }
@@ -969,7 +941,7 @@ public class SecureShelterModSystem : ModSystem
             player.PlayerUID, origin.X, origin.Y, origin.Z);
 
         // DimensionSpawn lands the player at the fixed spawn. Manifold force-sends the chunks; the
-        // repair pass places the bosco interior (first time) and stamps the return arch.
+        // repair pass places the bosco interior (first time).
         Manifold!.Transitions.TeleportPlayer(player, PocketDimCode, new TransitionOptions());
         SchedulePocketRepair();
         sapi!.SendMessage(player, 0, "You step through into the pocket.", EnumChatType.Notification);
