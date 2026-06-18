@@ -7,7 +7,7 @@ namespace SecureShelter;
 /// The concrete dimension-local geometry of the pocket, computed once at startup from the
 /// <see cref="SecureShelterConfig"/> and the interior schematic's measured size. Everything the worldgen
 /// and the runtime need is precomputed here, so the shell is always sized to "whatever dimensions"
-/// the bosco schematic has — there are no scattered magic numbers.
+/// the shelter schematic has — there are no scattered magic numbers.
 /// </summary>
 public sealed class PocketGeometry
 {
@@ -15,7 +15,7 @@ public sealed class PocketGeometry
     public int FloorY;
 
     // Inner shell footprint (the unbreakable "bedrock" walls): x in [ShellMinX..ShellMaxX],
-    // z in [ShellMinZ..ShellMaxZ], y in [FloorY..ShellTopY]. Coincides with the bosco footprint.
+    // z in [ShellMinZ..ShellMaxZ], y in [FloorY..ShellTopY]. Coincides with the shelter footprint.
     public int ShellMinX, ShellMaxX, ShellMinZ, ShellMaxZ, ShellTopY;
 
     // Outer dirt wrapper, WrapperThickness blocks out on every side (seals light leaks).
@@ -26,8 +26,8 @@ public sealed class PocketGeometry
     public int RelightHeight;
     public int GenerationRadius;
 
-    // Where the bosco schematic is stamped: centred in the (possibly larger) box footprint.
-    public int BoscoOriginX, BoscoOriginZ;
+    // Where the shelter schematic is stamped: centred in the (possibly larger) box footprint.
+    public int ShelterOriginX, ShelterOriginZ;
 
     public string ShellBlockCode = "game:mantle";
     public string ShellBlockFallback = "game:rock-granite";
@@ -35,20 +35,20 @@ public sealed class PocketGeometry
 
     /// <summary>
     /// Builds the geometry from the config and the schematic's measured size. The box footprint is the
-    /// larger of the bosco size and <see cref="SecureShelterConfig.MinBoxSize"/> on each axis, and the bosco
+    /// larger of the shelter size and <see cref="SecureShelterConfig.MinBoxSize"/> on each axis, and the shelter
     /// is centred within it. A non-positive size (unreadable schematic) falls back to 40×30×40.
     /// </summary>
-    public static PocketGeometry Build(SecureShelterConfig cfg, int boscoSizeX, int boscoSizeY, int boscoSizeZ,
+    public static PocketGeometry Build(SecureShelterConfig cfg, int shelterSizeX, int shelterSizeY, int shelterSizeZ,
         (int X, int Y, int Z)? archMarker = null)
     {
-        if (boscoSizeX <= 0) boscoSizeX = 40;
-        if (boscoSizeY <= 0) boscoSizeY = 30;
-        if (boscoSizeZ <= 0) boscoSizeZ = 40;
+        if (shelterSizeX <= 0) shelterSizeX = 40;
+        if (shelterSizeY <= 0) shelterSizeY = 30;
+        if (shelterSizeZ <= 0) shelterSizeZ = 40;
 
         int t = Math.Max(0, SecureShelterConfig.WrapperThickness);
         int min = Math.Max(1, SecureShelterConfig.MinBoxSize);
-        int boxX = Math.Max(boscoSizeX, min);
-        int boxZ = Math.Max(boscoSizeZ, min);
+        int boxX = Math.Max(shelterSizeX, min);
+        int boxZ = Math.Max(shelterSizeZ, min);
 
         // World position of the box's min corner. The box would otherwise generate at the dimension's
         // (0,0) corner, where its outer dirt wall (at -1) falls off the map and gets cut — so it's
@@ -64,11 +64,11 @@ public sealed class PocketGeometry
             ShellMaxX = ox + boxX - 1,
             ShellMinZ = oz,
             ShellMaxZ = oz + boxZ - 1,
-            ShellTopY = SecureShelterConfig.FloorY + boscoSizeY - 1 + Math.Max(0, SecureShelterConfig.CeilingHeadroom),
+            ShellTopY = SecureShelterConfig.FloorY + shelterSizeY - 1 + Math.Max(0, SecureShelterConfig.CeilingHeadroom),
 
-            // Centre the bosco in the (possibly larger) footprint.
-            BoscoOriginX = ox + (boxX - boscoSizeX) / 2,
-            BoscoOriginZ = oz + (boxZ - boscoSizeZ) / 2,
+            // Centre the shelter in the (possibly larger) footprint.
+            ShelterOriginX = ox + (boxX - shelterSizeX) / 2,
+            ShelterOriginZ = oz + (boxZ - shelterSizeZ) / 2,
 
             ShellBlockCode = SecureShelterConfig.ShellBlockCode,
             ShellBlockFallback = SecureShelterConfig.ShellBlockFallback,
@@ -87,8 +87,8 @@ public sealed class PocketGeometry
         if (archMarker.HasValue)
         {
             var m = archMarker.Value;     // schematic-relative position of the marker
-            g.ArchCenterX = Math.Clamp(g.BoscoOriginX + m.X, g.ShellMinX + 2, g.ShellMaxX - 2);
-            g.ArchZ       = Math.Clamp(g.BoscoOriginZ + m.Z, g.ShellMinZ + 1, g.ShellMaxZ - 1);
+            g.ArchCenterX = Math.Clamp(g.ShelterOriginX + m.X, g.ShellMinX + 2, g.ShellMaxX - 2);
+            g.ArchZ       = Math.Clamp(g.ShelterOriginZ + m.Z, g.ShellMinZ + 1, g.ShellMaxZ - 1);
             g.ArchBaseY   = SecureShelterConfig.FloorY + m.Y;     // schematic is placed with its base at FloorY
         }
         else
@@ -99,7 +99,7 @@ public sealed class PocketGeometry
         }
 
         // Arrival sits on the arch's column but nudged 4 blocks toward the box centre (the interior
-        // side of the arch), so the player faces into the bosco — not wedged between the arch and the
+        // side of the arch), so the player faces into the shelter — not wedged between the arch and the
         // nearest wall — and isn't standing in the doorway (which would instantly trigger a return).
         int towardCentre = g.ArchZ <= (g.ShellMinZ + g.ShellMaxZ) / 2 ? 1 : -1;
         g.SpawnX = g.ArchCenterX;
@@ -110,7 +110,7 @@ public sealed class PocketGeometry
         g.RelightHeight = g.DirtTopY + 1;
 
         // Generation radius must reach every footprint chunk from the spawn chunk (Manifold generates
-        // a square of chunks around the fixed spawn). Derive it so large/off-centre boscos fully gen.
+        // a square of chunks around the fixed spawn). Derive it so large/off-centre shelters fully gen.
         static int Fd(int a, int b) => (int)Math.Floor((double)a / b);
         int scx = Fd(g.SpawnX, 32), scz = Fd(g.SpawnZ, 32);
         int rad = Math.Max(

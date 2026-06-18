@@ -23,7 +23,7 @@ public class SecureShelterModSystem : ModSystem
     public static readonly AssetLocation OverworldCode = new("manifold", "overworld");
 
     // Loaded from ModConfig/SecureShelterConfig.json; all concrete coordinates live in `geo`, which is
-    // computed from this config plus the bosco schematic's measured size (so the shell wraps it
+    // computed from this config plus the shelter schematic's measured size (so the shell wraps it
     // exactly). Both are resolved in StartServerSide before the dimension is registered.
     private SecureShelterConfig config = null!;
     private PocketGeometry geo = null!;
@@ -32,8 +32,8 @@ public class SecureShelterModSystem : ModSystem
     private AssetLocation PocketDimCode => geo.DimCode;
 
     // The pre-built interior (a forest), placed once into the shell on first entry.
-    private AssetLocation boscoAsset = null!;
-    private BlockSchematic? boscoSchematic;
+    private AssetLocation shelterAsset = null!;
+    private BlockSchematic? shelterSchematic;
 
     /// <summary>Server-side Manifold facade, resolved in <see cref="StartServerSide"/>.</summary>
     public IManifoldServer? Manifold { get; private set; }
@@ -101,8 +101,8 @@ public class SecureShelterModSystem : ModSystem
 
         // Load the interior schematic up front so its measured size can drive the cube geometry, and
         // pull out the arch-marker block (if any) so its position becomes the return arch.
-        boscoAsset = new AssetLocation(Domain, SecureShelterConfig.BoscoSchematicPath);
-        BlockSchematic? schem = GetBoscoSchematic();
+        shelterAsset = new AssetLocation(Domain, SecureShelterConfig.ShelterSchematicPath);
+        BlockSchematic? schem = GetShelterSchematic();
         (int X, int Y, int Z)? archMarker = schem != null ? FindAndStripArchMarker(schem) : null;
         geo = PocketGeometry.Build(config, schem?.SizeX ?? 0, schem?.SizeY ?? 0, schem?.SizeZ ?? 0, archMarker);
         Mod.Logger.Notification(
@@ -216,7 +216,7 @@ public class SecureShelterModSystem : ModSystem
 
     // Find all refillable blocks in the pocket and snapshot their full/lit state. Walks only the
     // footprint chunks' block-entity lists (a handful of chunks), not the whole volume. Run during
-    // the post-entry repair pass, when the bosco has just been (re)placed and everything is full.
+    // the post-entry repair pass, when the shelter has just been (re)placed and everything is full.
     private void DiscoverRefillables()
     {
         if (sapi == null || PocketDimId < 0) return;
@@ -455,6 +455,7 @@ public class SecureShelterModSystem : ModSystem
             Manifold.Transitions.TeleportPlayer(
                 player, PocketDimCode, new TransitionOptions { OverridePosition = PocketSpawnPos() });
             SchedulePocketRepair();
+            sapi.World.RegisterCallback(_ => LiftToAir(player), 1000);
             Mod.Logger.Notification("[SecureShelter] Restored uid={0} into pocket on login.", player.PlayerUID);
         }, 1500);
     }
@@ -492,6 +493,42 @@ public class SecureShelterModSystem : ModSystem
     // ── Chunk loading + interior setup ───────────────────────────────────────
     private BlockPos PocketSpawnPos() => new(geo.SpawnX, geo.SpawnY, geo.SpawnZ, PocketDimId);
 
+    // The shelter's surface height varies, so the fixed spawn can land the player inside the terrain.
+    // After arrival, if the player's feet/head cell is solid, raise them to the first spot with two
+    // passable cells (feet + head) so they stand in the open instead of suffocating. No-op if already
+    // clear. Must run after the shelter is placed, so the terrain exists to test against.
+    private void LiftToAir(IServerPlayer player)
+    {
+        if (sapi == null || PocketDimId < 0 || player.Entity == null) return;
+        EntityPos ep = player.Entity.Pos;
+        if (DimFromInternalY(ep.InternalY) != PocketDimId) return;
+
+        IBlockAccessor ba = sapi.World.BlockAccessor;
+        int x = (int)Math.Floor(ep.X), z = (int)Math.Floor(ep.Z);
+        int feetY = (int)Math.Floor(ep.InternalY) - PocketDimId * BlockPos.DimensionBoundary;
+
+        int y = feetY;
+        bool found = false;
+        for (; y <= geo.ShellTopY; y++)
+            if (IsPassable(ba, x, y, z) && IsPassable(ba, x, y + 1, z)) { found = true; break; }
+
+        if (!found || y <= feetY) return;
+
+        // Raise by the block delta in the entity's own coordinate space (Pos.Y), so it's correct
+        // whether Pos.Y is dimension-local or internal — passing an absolute internal Y here flung the
+        // player out of the pocket into the void.
+        player.Entity.TeleportToDouble(ep.X, ep.Y + (y - feetY), ep.Z);
+        Mod.Logger.Notification("[SecureShelter] Lifted uid={0} y {1}->{2} (spawn was inside a block).",
+            player.PlayerUID, feetY, y);
+    }
+
+    // A cell a player can occupy: air, or any block without a collision box (grass, flowers, …).
+    private bool IsPassable(IBlockAccessor ba, int x, int localY, int z)
+    {
+        Block b = ba.GetBlock(new BlockPos(x, localY, z, PocketDimId));
+        return b == null || b.Id == 0 || b.CollisionBoxes == null || b.CollisionBoxes.Length == 0;
+    }
+
     private void EnsurePocketChunksLoaded()
     {
         if (sapi == null || PocketDimId < 0) return;
@@ -506,38 +543,38 @@ public class SecureShelterModSystem : ModSystem
             sapi.WorldManager.LoadChunkColumnForDimension(cx, cz, PocketDimId);
     }
 
-    // After a transit into the pocket: place the bosco interior (once) and snapshot refillables. Two
+    // After a transit into the pocket: place the shelter interior (once) and snapshot refillables. Two
     // staggered passes because the footprint chunks may not all be loaded on the first. The return
     // portal needs no stamping: the arch is baked into the schematic, and the arch-marker block's
     // position (see FindAndStripArchMarker) is the walk-through trigger.
     //
-    // First-entry lighting: the bosco is stamped live and its relight settles on a background thread a
-    // beat after EnsureBoscoPlaced's immediate resend — so the client can be left holding the dark,
+    // First-entry lighting: the shelter is stamped live and its relight settles on a background thread a
+    // beat after EnsureShelterPlaced's immediate resend — so the client can be left holding the dark,
     // pre-relight chunks (only a relog re-sent them, hence "only the first time"). The delayed resend
     // below pushes the settled, lit footprint to the client. No-op on later entries (the dimension is
     // persistent, so its chunks are already lit) and when no one is inside.
     private void SchedulePocketRepair()
     {
         if (sapi == null) return;
-        sapi.World.RegisterCallback(_ => { EnsureBoscoPlaced(); DiscoverRefillables(); }, 2000);
-        sapi.World.RegisterCallback(_ => { EnsureBoscoPlaced(); DiscoverRefillables(); }, 3500);
+        sapi.World.RegisterCallback(_ => { EnsureShelterPlaced(); DiscoverRefillables(); }, 2000);
+        sapi.World.RegisterCallback(_ => { EnsureShelterPlaced(); DiscoverRefillables(); }, 3500);
         sapi.World.RegisterCallback(_ => ResendPocketChunks(), 5000);
     }
 
-    // Stamp the bosco schematic into the shell once per dimension (guarded by a savegame flag),
+    // Stamp the shelter schematic into the shell once per dimension (guarded by a savegame flag),
     // aligned to the cube footprint with its base on the floor. Returns the number of blocks placed.
-    internal int EnsureBoscoPlaced(bool force = false)
+    internal int EnsureShelterPlaced(bool force = false)
     {
         if (sapi == null || PocketDimId < 0) return 0;
 
-        string key = "secureshelter:boscoPlaced-" + PocketDimCode.Path;
+        string key = "secureshelter:shelterPlaced-" + PocketDimCode.Path;
         if (!force && sapi.World.Config.GetBool(key)) return 0;
 
-        BlockSchematic? schem = GetBoscoSchematic();
+        BlockSchematic? schem = GetShelterSchematic();
         if (schem == null) return 0;
 
         EnsurePocketChunksLoaded();
-        var origin = new BlockPos(geo.BoscoOriginX, geo.FloorY, geo.BoscoOriginZ, PocketDimId);
+        var origin = new BlockPos(geo.ShelterOriginX, geo.FloorY, geo.ShelterOriginZ, PocketDimId);
 
         int placed;
         try
@@ -551,12 +588,12 @@ public class SecureShelterModSystem : ModSystem
         }
         catch (Exception e)
         {
-            Mod.Logger.Error("[SecureShelter] bosco placement threw: {0}", e);
+            Mod.Logger.Error("[SecureShelter] shelter placement threw: {0}", e);
             return 0;
         }
 
         Mod.Logger.Notification(
-            "[SecureShelter] Bosco placement: {0} blocks at ({1},{2},{3}) dim {4}.",
+            "[SecureShelter] Shelter placement: {0} blocks at ({1},{2},{3}) dim {4}.",
             placed, origin.X, origin.Y, origin.Z, PocketDimId);
 
         // 0 placed → the footprint chunks weren't loaded yet; leave the flag unset so a later pass
@@ -623,7 +660,7 @@ public class SecureShelterModSystem : ModSystem
 
     // Force-resend the footprint chunk columns to every player currently in the pocket. The bulk
     // accessor's own sync is unreliable in this dimension (same family as the relight issue), so
-    // this guarantees the freshly-placed bosco actually shows up client-side.
+    // this guarantees the freshly-placed shelter actually shows up client-side.
     private void ResendPocketChunks()
     {
         if (sapi == null || PocketDimId < 0) return;
@@ -646,31 +683,31 @@ public class SecureShelterModSystem : ModSystem
         return code != null && code.Domain == Domain && code.Path == "securesheltercomponents";
     }
 
-    private BlockSchematic? GetBoscoSchematic()
+    private BlockSchematic? GetShelterSchematic()
     {
-        if (boscoSchematic != null) return boscoSchematic;
+        if (shelterSchematic != null) return shelterSchematic;
 
         // "schematics" is not a scanned asset category, so Assets.TryGet won't find it. Try it
         // anyway (cheap), then fall back to reading the file straight out of the mod folder/zip.
-        string? json = sapi!.Assets.TryGet(boscoAsset, true)?.ToText() ?? ReadBoscoFromModFile();
+        string? json = sapi!.Assets.TryGet(shelterAsset, true)?.ToText() ?? ReadShelterFromModFile();
         if (json == null)
         {
-            Mod.Logger.Warning("[SecureShelter] bosco schematic could not be loaded (asset + mod file both missing).");
+            Mod.Logger.Warning("[SecureShelter] shelter schematic could not be loaded (asset + mod file both missing).");
             return null;
         }
 
         string err = "";
-        boscoSchematic = BlockSchematic.LoadFromString(json, ref err);
-        if (boscoSchematic == null)
-            Mod.Logger.Warning("[SecureShelter] bosco LoadFromString failed: {0}", err);
+        shelterSchematic = BlockSchematic.LoadFromString(json, ref err);
+        if (shelterSchematic == null)
+            Mod.Logger.Warning("[SecureShelter] shelter LoadFromString failed: {0}", err);
         else
-            StripBannedBlocks(boscoSchematic);
-        return boscoSchematic;
+            StripBannedBlocks(shelterSchematic);
+        return shelterSchematic;
     }
 
     // Delete banned blocks (e.g. the crash-prone cabinet) from a freshly loaded schematic, along with
     // their block-entities and any decor, so they're never placed in the pocket — regardless of what
-    // ends up in a re-exported bosco.
+    // ends up in a re-exported shelter.
     private void StripBannedBlocks(BlockSchematic schem)
     {
         if (SecureShelterConfig.BannedBlockPrefixes == null || SecureShelterConfig.BannedBlockPrefixes.Length == 0) return;
@@ -704,17 +741,17 @@ public class SecureShelterModSystem : ModSystem
             schem.DecorIds = dd;
         }
 
-        Mod.Logger.Notification("[SecureShelter] Stripped {0} banned block(s) from the bosco schematic.", removed.Count);
+        Mod.Logger.Notification("[SecureShelter] Stripped {0} banned block(s) from the shelter schematic.", removed.Count);
     }
 
     // Read the schematic directly from this mod's source (folder or packed zip), bypassing the
     // asset manager — which doesn't index the "schematics" category.
-    private string? ReadBoscoFromModFile()
+    private string? ReadShelterFromModFile()
     {
         try
         {
             string src = Mod.SourcePath;
-            string rel = "assets/" + Domain + "/" + SecureShelterConfig.BoscoSchematicPath;
+            string rel = "assets/" + Domain + "/" + SecureShelterConfig.ShelterSchematicPath;
 
             if (Directory.Exists(src))   // mod is an unpacked folder
             {
@@ -734,7 +771,7 @@ public class SecureShelterModSystem : ModSystem
 
                 if (entry == null)
                 {
-                    Mod.Logger.Warning("[SecureShelter] bosco entry '{0}' not found in mod zip '{1}'.", rel, src);
+                    Mod.Logger.Warning("[SecureShelter] shelter entry '{0}' not found in mod zip '{1}'.", rel, src);
                     return null;
                 }
                 using Stream s = entry.Open();
@@ -744,7 +781,7 @@ public class SecureShelterModSystem : ModSystem
         }
         catch (Exception e)
         {
-            Mod.Logger.Warning("[SecureShelter] reading bosco from mod file failed: {0}", e.Message);
+            Mod.Logger.Warning("[SecureShelter] reading shelter from mod file failed: {0}", e.Message);
         }
         return null;
     }
@@ -760,7 +797,7 @@ public class SecureShelterModSystem : ModSystem
                 .WithWorldgen(new PocketShellWorldgen(geo))
                 .WithFixedSpawn(new BlockPos(geo.SpawnX, geo.SpawnY, geo.SpawnZ, 0))
                 .WithSpawnBehavior(SpawnBehavior.DimensionSpawn)
-                // Radius derived from the footprint so the whole cube generates, even for large boscos.
+                // Radius derived from the footprint so the whole cube generates, even for large shelters.
                 .WithGenerationRadius(geo.GenerationRadius)
                 .WithRelightHeight(geo.RelightHeight)
                 // The pocket keeps its own hotbar + backpack: on entry the player's overworld held items
@@ -803,9 +840,9 @@ public class SecureShelterModSystem : ModSystem
                 return TextCommandResult.Success("Entering the pocket...");
             });
 
-        // /pocket rebuild — force (re)placement of the bosco interior.
+        // /pocket rebuild — force (re)placement of the shelter interior.
         pocket.BeginSubCommand("rebuild")
-            .WithDescription("Force re-stamp the bosco interior (debug).")
+            .WithDescription("Force re-stamp the shelter interior (debug).")
             .RequiresPrivilege("chat")
             .RequiresPlayer()
             .HandleWith(args =>
@@ -815,8 +852,8 @@ public class SecureShelterModSystem : ModSystem
                 if (DimFromInternalY(player.Entity.Pos.InternalY) != PocketDimId)
                     return TextCommandResult.Error("You are not in the pocket dimension.");
 
-                int placed = EnsureBoscoPlaced(force: true);
-                return TextCommandResult.Success($"Bosco rebuild: {placed} blocks placed.");
+                int placed = EnsureShelterPlaced(force: true);
+                return TextCommandResult.Success($"Shelter rebuild: {placed} blocks placed.");
             })
             .EndSubCommand();
 
@@ -968,10 +1005,12 @@ public class SecureShelterModSystem : ModSystem
             player.PlayerUID, origin.X, origin.Y, origin.Z);
 
         // DimensionSpawn lands the player at the fixed spawn. Manifold force-sends the chunks; the
-        // repair pass places the bosco interior (first time).
+        // repair pass places the shelter interior (first time).
         Manifold!.Transitions.TeleportPlayer(player, PocketDimCode, new TransitionOptions());
         SchedulePocketRepair();
-        sapi!.SendMessage(player, 0, "You step through into the pocket.", EnumChatType.Notification);
+        // Raise the player out of the terrain if the spawn landed inside it (after the shelter is placed).
+        sapi!.World.RegisterCallback(_ => LiftToAir(player), 4000);
+        sapi.SendMessage(player, 0, "You step through into the pocket.", EnumChatType.Notification);
     }
 
     private void ReturnFromPocket(IServerPlayer player)

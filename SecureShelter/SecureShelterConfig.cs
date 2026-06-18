@@ -45,8 +45,8 @@ public sealed class SecureShelterConfig
     /// north (+Z) of it. Lets the builder mark the exit precisely. Matched against the block code.</summary>
     public const string ArchMarkerBlockCode = "creativeglow-79";
 
-    /// <summary>Minimum box footprint on each axis. The cube is the larger of the bosco's size and
-    /// this, and the bosco is centred inside it. So a small schematic still gets a 40×40 floor.</summary>
+    /// <summary>Minimum box footprint on each axis. The cube is the larger of the shelter's size and
+    /// this, and the shelter is centred inside it. So a small schematic still gets a 40×40 floor.</summary>
     public const int MinBoxSize = 40;
 
     /// <summary>Empty layers left above the interior before the ceiling (head clearance).</summary>
@@ -63,7 +63,7 @@ public sealed class SecureShelterConfig
     public const string WrapperBlockCode = "game:soil-medium-none";
 
     /// <summary>Path (under <c>assets/secureshelter/</c>) to the interior schematic stamped into the cube.</summary>
-    public const string BoscoSchematicPath = "schematics/shelter.json";
+    public const string ShelterSchematicPath = "schematics/shelter.json";
 
     /// <summary>Block-code prefixes deleted from the schematic when it loads (along with their
     /// block-entities and decor). Defaults to the vanilla cabinet, whose display slots NRE-crash the
@@ -71,11 +71,13 @@ public sealed class SecureShelterConfig
     public static readonly string[] BannedBlockPrefixes = { "cabinet" };
 
     /// <summary>Block-code prefixes whose contents are kept topped up (snapshotted full/lit just after
-    /// the bosco is placed, then restored on a take). Covers liquids, food, always-lit firepits,
-    /// cuttable cheese/pie, and ground storage placed in the schematic.</summary>
+    /// the shelter is placed, then restored on a take). Covers liquids, food, always-lit firepits,
+    /// cuttable cheese/pie, ground storage placed in the schematic, and torch holders (a taken torch
+    /// regrows: the empty holder is restored to its filled/lit variant).</summary>
     public static readonly string[] RefillableBlockPrefixes =
     {
-        "barrel", "jug", "jar", "storagevessel", "crock", "firepit", "cheese", "pie", "shelf", "groundstorage"
+        "barrel", "jug", "jar", "storagevessel", "crock", "firepit", "cheese", "pie", "shelf",
+        "groundstorage", "torchholder"
     };
 
     /// <summary>Block-code prefixes the player may interact with inside the pocket. Every other

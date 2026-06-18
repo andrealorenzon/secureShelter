@@ -7,9 +7,9 @@ namespace SecureShelter;
 /// <summary>
 /// Builds the pocket dimension as a hollow shell of "bedrock" (mantle) wrapped in an opaque dirt
 /// box (mantle absorbs no light, so light would otherwise leak straight through). The shell is
-/// sized to whatever the bosco schematic measures — see <see cref="PocketGeometry"/>. The interior
-/// is left empty here; the bosco forest is stamped in at runtime (see
-/// <see cref="SecureShelterModSystem.EnsureBoscoPlaced"/>), and the entry portal (the painting) lives in
+/// sized to whatever the shelter schematic measures — see <see cref="PocketGeometry"/>. The interior
+/// is left empty here; the shelter forest is stamped in at runtime (see
+/// <see cref="SecureShelterModSystem.EnsureShelterPlaced"/>), and the entry portal (the painting) lives in
 /// the overworld.
 /// </summary>
 public sealed class PocketShellWorldgen : IWorldgenStrategy
@@ -55,7 +55,7 @@ public sealed class PocketShellWorldgen : IWorldgenStrategy
                 // Opaque dirt wrapper over the whole footprint.
                 BuildWrapperColumn(ctx, dim, wx, wz);
 
-                // Mantle shell only inside the inner (bosco-sized) footprint.
+                // Mantle shell only inside the inner (shelter-sized) footprint.
                 if (wx >= geo.ShellMinX && wx <= geo.ShellMaxX &&
                     wz >= geo.ShellMinZ && wz <= geo.ShellMaxZ)
                 {
