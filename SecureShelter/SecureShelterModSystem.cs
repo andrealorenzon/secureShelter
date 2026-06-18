@@ -506,17 +506,22 @@ public class SecureShelterModSystem : ModSystem
             sapi.WorldManager.LoadChunkColumnForDimension(cx, cz, PocketDimId);
     }
 
-    // After a transit into the pocket: place the bosco interior (once) and snapshot refillables.
-    // Lighting is handled natively — the interior sits inside the relight band (low FloorY +
-    // WithRelightHeight) and the bosco is placed through a relighting bulk accessor. Two staggered
-    // passes because the footprint chunks may not all be loaded on the first. The return portal needs
-    // no stamping: the arch is baked into the schematic, and the arch-marker block's position (see
-    // FindAndStripArchMarker) is the walk-through trigger — the marker is stripped to air (the opening).
+    // After a transit into the pocket: place the bosco interior (once) and snapshot refillables. Two
+    // staggered passes because the footprint chunks may not all be loaded on the first. The return
+    // portal needs no stamping: the arch is baked into the schematic, and the arch-marker block's
+    // position (see FindAndStripArchMarker) is the walk-through trigger.
+    //
+    // First-entry lighting: the bosco is stamped live and its relight settles on a background thread a
+    // beat after EnsureBoscoPlaced's immediate resend — so the client can be left holding the dark,
+    // pre-relight chunks (only a relog re-sent them, hence "only the first time"). The delayed resend
+    // below pushes the settled, lit footprint to the client. No-op on later entries (the dimension is
+    // persistent, so its chunks are already lit) and when no one is inside.
     private void SchedulePocketRepair()
     {
         if (sapi == null) return;
         sapi.World.RegisterCallback(_ => { EnsureBoscoPlaced(); DiscoverRefillables(); }, 2000);
         sapi.World.RegisterCallback(_ => { EnsureBoscoPlaced(); DiscoverRefillables(); }, 3500);
+        sapi.World.RegisterCallback(_ => ResendPocketChunks(), 5000);
     }
 
     // Stamp the bosco schematic into the shell once per dimension (guarded by a savegame flag),
@@ -563,8 +568,9 @@ public class SecureShelterModSystem : ModSystem
     }
 
     // If the schematic contains the configured arch-marker block, return its position (relative to
-    // the schematic) and strip it to air — that opening becomes the return-portal trigger (the arch
-    // visual is already baked into the schematic). Returns null if no marker is present.
+    // the schematic) and replace it with the surrounding floor block — the marker sits in the doorway
+    // FLOOR, so stripping it to air would gouge a 1-deep hole. The walk-through trigger is the opening
+    // above it (see IsArchHole). Returns null if no marker is present.
     private (int X, int Y, int Z)? FindAndStripArchMarker(BlockSchematic schem)
     {
         string code = SecureShelterConfig.ArchMarkerBlockCode;
@@ -578,6 +584,12 @@ public class SecureShelterModSystem : ModSystem
         }
         if (markerId < 0) return null;
 
+        // Index → block id, to sample the floor block around the marker.
+        var byIndex = new Dictionary<uint, int>(schem.Indices.Count);
+        for (int i = 0; i < schem.Indices.Count; i++) byIndex[schem.Indices[i]] = schem.BlockIds[i];
+
+        static uint Pack(int x, int y, int z) => (uint)(x | (z << 10) | (y << 20));
+
         for (int i = 0; i < schem.BlockIds.Count; i++)
         {
             if (schem.BlockIds[i] != markerId) continue;
@@ -585,11 +597,24 @@ public class SecureShelterModSystem : ModSystem
             uint idx = schem.Indices[i];
             int rx = (int)(idx & 0x3FF), rz = (int)((idx >> 10) & 0x3FF), ry = (int)((idx >> 20) & 0x3FF);
 
-            schem.Indices.RemoveAt(i);
-            schem.BlockIds.RemoveAt(i);
+            // Fill the marker cell with an adjacent floor block (same Y), else the block below, so the
+            // doorway floor stays flush. If nothing's found, fall back to leaving it as air.
+            int fillId = -1;
+            foreach (uint n in new[] { Pack(rx - 1, ry, rz), Pack(rx + 1, ry, rz), Pack(rx, ry, rz - 1), Pack(rx, ry, rz + 1), Pack(rx, ry - 1, rz) })
+                if (byIndex.TryGetValue(n, out int got)) { fillId = got; break; }
+
+            if (fillId >= 0)
+            {
+                schem.BlockIds[i] = fillId;
+            }
+            else
+            {
+                schem.Indices.RemoveAt(i);
+                schem.BlockIds.RemoveAt(i);
+            }
             schem.BlockEntities?.Remove(idx);
 
-            Mod.Logger.Notification("[SecureShelter] Arch marker '{0}' at schematic ({1},{2},{3}); portal trigger set there.",
+            Mod.Logger.Notification("[SecureShelter] Arch marker '{0}' at schematic ({1},{2},{3}); portal trigger set above it.",
                 code, rx, ry, rz);
             return (rx, ry, rz);
         }
@@ -883,8 +908,10 @@ public class SecureShelterModSystem : ModSystem
         }
     }
 
+    // ArchBaseY is the doorway FLOOR tile (the marker's cell, refilled with floor); the player walks
+    // through the 2-tall opening directly above it.
     private bool IsArchHole(int x, int y, int z)
-        => x == geo.ArchCenterX && z == geo.ArchZ && (y == geo.ArchBaseY || y == geo.ArchBaseY + 1);
+        => x == geo.ArchCenterX && z == geo.ArchZ && (y == geo.ArchBaseY + 1 || y == geo.ArchBaseY + 2);
 
     private void OnArchCrossed(IServerPlayer player)
     {

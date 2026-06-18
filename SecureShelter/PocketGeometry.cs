@@ -98,11 +98,13 @@ public sealed class PocketGeometry
             g.ArchBaseY   = SecureShelterConfig.FloorY + cfg.SpawnHeightAboveFloor;
         }
 
-        // Arrival always matches the return arch, nudged 4 blocks north (+Z) so the player doesn't
-        // spawn inside the doorway (which would instantly trigger a return).
+        // Arrival sits on the arch's column but nudged 4 blocks toward the box centre (the interior
+        // side of the arch), so the player faces into the bosco — not wedged between the arch and the
+        // nearest wall — and isn't standing in the doorway (which would instantly trigger a return).
+        int towardCentre = g.ArchZ <= (g.ShellMinZ + g.ShellMaxZ) / 2 ? 1 : -1;
         g.SpawnX = g.ArchCenterX;
         g.SpawnY = g.ArchBaseY;
-        g.SpawnZ = Math.Clamp(g.ArchZ + 4, g.ShellMinZ + 1, g.ShellMaxZ - 1);
+        g.SpawnZ = Math.Clamp(g.ArchZ + 4 * towardCentre, g.ShellMinZ + 1, g.ShellMaxZ - 1);
 
         // Cover the whole sealed box (relight band runs from y=0 up to this height).
         g.RelightHeight = g.DirtTopY + 1;
