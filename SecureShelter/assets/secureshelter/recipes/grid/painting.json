@@ -1,0 +1,46 @@
+{
+	"ingredientPattern": "FKI,KPK,GKC",
+	"width": 3,
+	"height": 3,
+	"ingredients": {
+		"K": {
+			"type": "item",
+			"code": "game:stick"
+		},
+		"P": {
+			"type": "item",
+			"code": "game:paper-parchment"
+		},
+		"I": {
+			"type": "item",
+			"code": "game:inkandquill"
+		},
+		"G": {
+			"type": "block",
+			"code": "game:bowl-*-fired",
+			"name": "bowl"
+		},
+		"F": {
+			"type": "block",
+			"code": "game:flower-horsetail-*",
+			"name": "flower",
+			"quantity": 4
+		},
+		"C": {
+			"type": "item",
+			"code": "secureshelter:securesheltercomponents"
+		}
+	},
+	"attributes": {
+		"liquidContainerProps": {
+			"requiresContent": { "type": "item", "code": "game:dye-green" },
+			"requiresLitres": 1.0
+		}
+	},
+	"name": "secureshelterpainting",
+	"output": {
+		"type": "block",
+		"code": "secureshelter:painting-storditishut-north",
+		"quantity": 1
+	}
+}
