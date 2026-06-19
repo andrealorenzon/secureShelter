@@ -25,8 +25,7 @@ mono_crash.*
 # Build results
 [Dd]ebug/
 [Dd]ebugPublic/
-[Rr]elease/
-[Rr]eleases/
+[Rr]eleases/secureshelter/
 x64/
 x86/
 [Ww][Ii][Nn]32/

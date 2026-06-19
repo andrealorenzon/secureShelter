@@ -35,6 +35,10 @@ public class SecureShelterModSystem : ModSystem
     private AssetLocation shelterAsset = null!;
     private BlockSchematic? shelterSchematic;
 
+    // World positions of the shelter's static light sources (block LightHsv > 0), computed once from
+    // the schematic. Relit by re-exchanging each block (see RelightLights).
+    private Dictionary<BlockPos, int>? lightPositions;
+
     /// <summary>Server-side Manifold facade, resolved in <see cref="StartServerSide"/>.</summary>
     public IManifoldServer? Manifold { get; private set; }
 
@@ -548,17 +552,16 @@ public class SecureShelterModSystem : ModSystem
     // portal needs no stamping: the arch is baked into the schematic, and the arch-marker block's
     // position (see FindAndStripArchMarker) is the walk-through trigger.
     //
-    // First-entry lighting: the shelter is stamped live and its relight settles on a background thread a
-    // beat after EnsureShelterPlaced's immediate resend — so the client can be left holding the dark,
-    // pre-relight chunks (only a relog re-sent them, hence "only the first time"). The delayed resend
-    // below pushes the settled, lit footprint to the client. No-op on later entries (the dimension is
-    // persistent, so its chunks are already lit) and when no one is inside.
+    // First-entry lighting: the place-time relight doesn't reach a remote client, so once the player
+    // has settled (chunks tracked) we re-trigger a per-light-source relight via ExchangeBlock — the
+    // same engine block-change path that works when a player places/removes a torch. Runs a couple of
+    // seconds after placement; cheap (no full-chunk resends), so no lag.
     private void SchedulePocketRepair()
     {
         if (sapi == null) return;
         sapi.World.RegisterCallback(_ => { EnsureShelterPlaced(); DiscoverRefillables(); }, 2000);
         sapi.World.RegisterCallback(_ => { EnsureShelterPlaced(); DiscoverRefillables(); }, 3500);
-        sapi.World.RegisterCallback(_ => ResendPocketChunks(), 5000);
+        sapi.World.RegisterCallback(_ => RelightLights(), 5000);
     }
 
     // Stamp the shelter schematic into the shell once per dimension (guarded by a savegame flag),
@@ -597,9 +600,9 @@ public class SecureShelterModSystem : ModSystem
             placed, origin.X, origin.Y, origin.Z, PocketDimId);
 
         // 0 placed → the footprint chunks weren't loaded yet; leave the flag unset so a later pass
-        // retries. Otherwise mark done and force a dimension-aware resend so the client sees it.
+        // retries. The bulk Commit above already synced the blocks; lighting is handled by the
+        // delayed RelightLights pass (see SchedulePocketRepair).
         if (placed <= 0) return 0;
-        ResendPocketChunks();
         sapi.World.Config.SetBool(key, true);
         return placed;
     }
@@ -656,6 +659,53 @@ public class SecureShelterModSystem : ModSystem
             return (rx, ry, rz);
         }
         return null;
+    }
+
+    // Decode the schematic once into world positions of its static light sources (blocks whose own
+    // LightHsv > 0 — candles, lanterns, firepit, torch holders, creativeglow; NOT the BE-driven
+    // ground-storage lamps, whose block LightHsv is 0). Index packing matches FindAndStripArchMarker.
+    private void BuildLightIndex()
+    {
+        if (lightPositions != null) return;
+        if (sapi == null || PocketDimId < 0) return;
+        BlockSchematic? schem = GetShelterSchematic();
+        if (schem == null) return;
+
+        lightPositions = new Dictionary<BlockPos, int>();
+        var lightIds = new Dictionary<int, int>();   // schematic block id -> world block id
+        foreach (var kv in schem.BlockCodes)
+        {
+            Block? b = kv.Value == null ? null : sapi.World.GetBlock(kv.Value);
+            if (b != null && b.LightHsv[2] > 0) lightIds[kv.Key] = b.BlockId;
+        }
+        if (lightIds.Count == 0) return;
+
+        for (int i = 0; i < schem.BlockIds.Count; i++)
+        {
+            if (!lightIds.ContainsKey(schem.BlockIds[i])) continue;
+            uint idx = schem.Indices[i];
+            int rx = (int)(idx & 0x3FF), rz = (int)((idx >> 10) & 0x3FF), ry = (int)((idx >> 20) & 0x3FF);
+            lightPositions[new BlockPos(geo.ShelterOriginX + rx, geo.FloorY + ry, geo.ShelterOriginZ + rz, PocketDimId)] = 0;
+        }
+    }
+
+    // Re-trigger a relight at each static light source by exchanging the block with itself. ExchangeBlock
+    // preserves the block entity and goes through the engine's block-change relight+sync path — the SAME
+    // path a player placing/removing a torch uses, which DOES propagate light to remote clients (unlike
+    // WorldManager.FullRelight, which silently failed on a dedicated server). Cheap: only the handful of
+    // light blocks, no full-chunk resends.
+    private void RelightLights()
+    {
+        if (sapi == null || PocketDimId < 0) return;
+        BuildLightIndex();
+        if (lightPositions == null || lightPositions.Count == 0) return;
+
+        IBlockAccessor ba = sapi.World.BlockAccessor;
+        foreach (BlockPos pos in lightPositions.Keys)
+        {
+            Block cur = ba.GetBlock(pos);
+            if (cur != null && cur.BlockId != 0) ba.ExchangeBlock(cur.BlockId, pos);
+        }
     }
 
     // Force-resend the footprint chunk columns to every player currently in the pocket. The bulk
@@ -854,6 +904,24 @@ public class SecureShelterModSystem : ModSystem
 
                 int placed = EnsureShelterPlaced(force: true);
                 return TextCommandResult.Success($"Shelter rebuild: {placed} blocks placed.");
+            })
+            .EndSubCommand();
+
+        // /pocket relight — force a full interior relight + resend (fixes dark static lights, esp. on
+        // a dedicated server where the first-entry resend didn't carry the light update).
+        pocket.BeginSubCommand("relight")
+            .WithDescription("Force a full relight of the shelter interior and resend to clients (debug).")
+            .RequiresPrivilege("chat")
+            .RequiresPlayer()
+            .HandleWith(args =>
+            {
+                if (args.Caller.Player is not IServerPlayer player || player.Entity == null)
+                    return TextCommandResult.Error("No player.");
+                if (DimFromInternalY(player.Entity.Pos.InternalY) != PocketDimId)
+                    return TextCommandResult.Error("You are not in the pocket dimension.");
+
+                RelightLights();
+                return TextCommandResult.Success("Relit the shelter light sources.");
             })
             .EndSubCommand();
 
