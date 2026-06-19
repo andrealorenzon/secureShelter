@@ -3,18 +3,19 @@
 	"width": 3,
 	"height": 3,
 	"ingredients": {
-		"T": { "type": "item", "code": "game:stone-*" },
+		"T": { "type": "item", "code": "game:stone-*", "name": "stone", "allowedVariants": ["andesite", "chalk", "chert", "conglomerate", "limestone", "claystone", "granite", "sandstone", "shale", "basalt", "peridotite", "phyllite", "slate"] },
 		"D": { "type": "item", "code": "game:lime" },
-		"S": { "type": "block", "code": "game:sand-*" },
+		"S": { "type": "block", "code": "game:sand-*", "name": "sand", "allowedVariants": ["andesite", "chalk", "chert", "conglomerate", "limestone", "claystone", "granite", "sandstone", "shale", "basalt", "peridotite", "phyllite", "slate"] },
 		"W": { "type": "item", "code": "game:stick", "quantity": 2 },
-		"B": { "type": "block", "code": "game:bowl-*-fired" },
+		"B": { "type": "block", "code": "game:bowl-*-fired", "name": "bowl", "allowedVariants": ["blue", "fire", "black", "brown", "cream", "earthyorange", "gray", "orange", "red", "tan"] },
 		"L": { "type": "item", "code": "game:linensack" }
 	},
 	"attributes": {
 		"liquidContainerProps": {
 			"requiresContent": { "type": "item", "code": "game:waterportion" },
-			"requiresLitres": 0.1
+			"requiresLitres": 1.0
 		}
 	},
+	"name": "securesheltercomponents",
 	"output": { "type": "item", "code": "secureshelter:securesheltercomponents", "quantity": 1 }
 }
