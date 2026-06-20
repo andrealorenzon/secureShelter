@@ -171,17 +171,18 @@ public class SecureShelterModSystem : ModSystem
         return false;
     }
 
-    // Doors and harmless interactions stay free. Whitelisted containers (barrels, jugs/jars, vessels,
-    // crocks, firepit cooking pots, shelves, cheese/pie, chests, ground storage) are usable. Every
-    // other container is locked, so nothing can be stolen.
+    // Doors/levers/beds and harmless interactions stay free. Whitelisted containers (barrels, jugs/
+    // jars, vessels, crocks, firepit pots, shelves, cheese/pie, chests, ground storage) are usable;
+    // every other container is locked. "Takeable" decor — whose right-click removes the block or hands
+    // out an item (oil lamps via RightClickPickup/GroundStorable, candles via BlockBunchOCandles) — is
+    // also locked: it bypasses the place/break lock and taking it has desynced the dimension (void).
     private bool OnCanUseBlock(IServerPlayer byPlayer, BlockSelection blockSel)
     {
         if (!IsPlayerInPocket(byPlayer) || blockSel?.Position == null) return true;
 
-        BlockEntity? be = sapi!.World.BlockAccessor.GetBlockEntity(blockSel.Position);
-        if (be is not IBlockEntityContainer) return true;   // not a container (doors, levers, jugs w/o BE …)
+        Block block = sapi!.World.BlockAccessor.GetBlock(blockSel.Position);
+        string path = block.Code?.Path ?? "";
 
-        string path = sapi.World.BlockAccessor.GetBlock(blockSel.Position).Code?.Path ?? "";
         if (IsUsableContainerPath(path))
         {
             // Capture full state before the take. Ground storage is excluded: only the schematic's
@@ -191,7 +192,26 @@ public class SecureShelterModSystem : ModSystem
                 SnapshotRefillable(blockSel.Position);
             return true;
         }
-        return false;                                        // locked container
+
+        if (IsTakeableDecor(block)) return false;   // candles / oil lamps / ground-storables: locked
+
+        // Lock any other (non-whitelisted) container; leave plain blocks (doors, levers, beds …) free.
+        return sapi.World.BlockAccessor.GetBlockEntity(blockSel.Position) is not IBlockEntityContainer;
+    }
+
+    // True for blocks whose right-click takes the block or hands out an item, so they'd otherwise slip
+    // past the place/break lock. Behavior-based (covers oil lamps and anything with RightClickPickup or
+    // GroundStorable) plus an explicit check for the class-based candle stacks.
+    private static bool IsTakeableDecor(Block block)
+    {
+        if (block?.BlockBehaviors != null)
+            foreach (BlockBehavior b in block.BlockBehaviors)
+            {
+                string n = b.GetType().Name;
+                if (n.Contains("RightClickPickup") || n.Contains("GroundStorable")) return true;
+            }
+        string path = block?.Code?.Path ?? "";
+        return path.StartsWith("bunchocandles") || path.StartsWith("candle");
     }
 
     // Bowls (incl. meal-filled bowls) may be placed from hand or picked up off a table (ground
