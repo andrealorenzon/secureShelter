@@ -135,6 +135,11 @@ public class SecureShelterModSystem : ModSystem
         // Keep the pocket permanently dry (see OnPocketGetClimate).
         ((IEventAPI)sapi.Event).OnGetClimate += OnPocketGetClimate;
 
+        // Keep players in the pocket fully temporally stable. The stability query hook is no use here —
+        // it's handed a dimension-blind, dimension-LOCAL position, so it can't tell pocket from
+        // overworld — so instead we pin each pocket player's own stability to max on a slow tick.
+        sapi.Event.RegisterGameTickListener(_ => ForcePocketStability(), 1000);
+
         // Make the pocket a safe zone — no HP loss while inside (see HookInvulnerability).
         sapi.Event.PlayerNowPlaying += HookInvulnerability;
 
@@ -419,6 +424,23 @@ public class SecureShelterModSystem : ModSystem
         if (pos.dimension != PocketDimId && pos.Y / BlockPos.DimensionBoundary != PocketDimId) return;
         climate.Rainfall = 0f;
         climate.RainCloudOverlay = 0f;
+    }
+
+    // Pin every player currently inside the pocket to full temporal stability (1.0), so the refuge is
+    // never a low/negative-stability zone — covers both the dimension-blind positional calc AND active
+    // temporal storms (which drain stability everywhere). We can't fix the world-stability query (it's
+    // handed a dimension-local position, so it can't identify the pocket), so we override the player's
+    // own stability stat directly. Runs on a 1 s tick; the per-tick drain between resets is negligible.
+    private void ForcePocketStability()
+    {
+        if (sapi == null || PocketDimId < 0) return;
+        foreach (IPlayer p in sapi.World.AllOnlinePlayers)
+        {
+            if (p is not IServerPlayer sp || sp.Entity == null) continue;
+            if (DimFromInternalY(sp.Entity.Pos.InternalY) != PocketDimId) continue;
+            sp.Entity.WatchedAttributes.SetDouble("temporalStability", 1.0);
+            sp.Entity.WatchedAttributes.MarkPathDirty("temporalStability");
+        }
     }
 
     private void LoadConfig(ICoreServerAPI sapi)
